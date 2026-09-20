@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>cttp</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui;
+        max-width: 42rem;
+        margin: 8vh auto;
+        padding: 0 1rem;
+        color: #183b56;
+      }
+      h1 {
+        font-size: 2rem;
+      }
+      code {
+        background: #eef2f6;
+        padding: 0.1rem 0.35rem;
+        border-radius: 0.25rem;
+      }
+      a {
+        color: #067ab8;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>cttp is alive</h1>
+    <p>
+      This page is served by a hand-written HTTP/1.1 server in C
+      (<code>static.c</code>). Try the API routes too:
+    </p>
+    <ul>
+      <li><code>GET /api/hello</code></li>
+      <li><code>GET /api/users/:id</code></li>
+      <li><code>POST /api/echo</code></li>
+      <li><code>GET /api/stream</code> — chunked responses</li>
+      <li><code>GET /api/headers</code></li>
+    </ul>
+  </body>
+</html>
