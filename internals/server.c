@@ -5,7 +5,7 @@
  * ---------------------------------------------
  * One thread multiplexes every socket with poll(), using non-blocking I/O
  * (O_NONBLOCK). An fd is never allowed to block: when write/read would
- * block we simply stop and resume when poll() says the socket is ready.
+ * block one simply stops and resume when poll() says the socket is ready.
  *
  * pfds[] and conns[] are parallel arrays: pfds[i] describes fd state for
  * conns[i]. pfds[0] is always the listening socket.
@@ -94,7 +94,7 @@ static void conn_close(server *s, int idx)
     free(c);
 
     /* Remove slot idx by moving the last entry into it (O(1), but it
-     * changes iteration order — our loop tolerates re-checking slots). */
+     * changes iteration order — the loop tolerates re-checking slots). */
     s->conns[idx] = s->conns[s->nconns - 1];
     s->pfds[idx]  = s->pfds[s->nconns - 1];
     s->nconns--;
@@ -275,7 +275,7 @@ void server_run(server *s)
     while (s->running) {
         /* --- RENEW INTEREST: recompute what each socket should listen for.
          * This is the event-loop contract most tutorials skip: poll()'s
-         * .events are static, so we must update them every iteration to
+         * .events are static, so the loop must update them every iteration to
          * reflect each connection's state machine —
          *   pending response bytes -> also want POLLOUT (writability),
          *   otherwise -> want POLLIN (new request bytes). */
@@ -301,7 +301,7 @@ void server_run(server *s)
             conn *c = s->conns[i];
             short rev = s->pfds[i].revents; /* copy: slot may move on close */
             s->pfds[i].revents = 0;
-            int handled = 1;                /* did we consume this slot?   */
+            int handled = 1;                /* did this slot get consumed? */
 
             if (rev & (POLLERR | POLLHUP | POLLNVAL)) {
                 conn_close(s, i);

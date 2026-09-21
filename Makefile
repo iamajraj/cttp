@@ -1,23 +1,31 @@
-CC      = clang
-CFLAGS  = -std=c11 -Wall -Wextra -Wno-unused-parameter -O2 -g
-SRC     = src/buf.c src/log.c src/http.c src/router.c src/static.c src/server.c src/main.c
-HDR     = src/cttp.h src/buf.h
+CC     = clang
+CFLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude -O2
 
-cttp: $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -o cttp $(SRC)
+EXAMPLES := $(wildcard examples/0*.c)
+BINS := $(patsubst examples/%.c, build/%, $(EXAMPLES))
+
+### build the example servers against include/cttp.h
+build/% : examples/%.c include/cttp.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ $<
+
+all: $(BINS)
+
+# Regenerate include/cttp.h from the annotated sources in internals/
+gen:
+	sh scripts/gen_lib.sh
+	$(MAKE) -s all
 
 clean:
-	rm -f cttp
+	rm -rf build
 
-# curl test suite: run `make test` while the server runs on :8080
-test: cttp
-	./cttp -p 8080 &
-	@sleep 0.3
-	curl -s http://127.0.0.1:8080/api/hello
-	curl -s http://127.0.0.1:8080/
-	curl -s -X POST -d 'hi there' http://127.0.0.1:8080/api/echo
-	curl -s -r 0-49 http://127.0.0.1:8080/ -o /dev/null -w 'range: %{http_code}\n'
-	curl -s http://127.0.0.1:8080/api/stream
-	kill %1 2>/dev/null || true
+# smoke-test example 02 (REST API on :8082)
+test: build/02_rest_api
+	./build/02_rest_api &
+	@sleep 0.4
+	curl -s http://127.0.0.1:8082/
+	curl -s -X POST -d '{"name":"Ada"}' http://127.0.0.1:8082/users
+	curl -s -X DELETE http://127.0.0.1:8082/users/1 -w '|%{http_code}\n'
+	-kill %1 2>/dev/null
 
-.PHONY: test clean
+.PHONY: all gen clean test

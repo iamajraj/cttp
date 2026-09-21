@@ -1,85 +1,74 @@
-# cttp — a full-fledged HTTP/1.1 server written from scratch in C
+# cttp — build HTTP APIs in C with one file
 
-A single-threaded, event-driven HTTP server (~1000 lines) built on nothing but
-POSIX sockets — no threads, no epoll, no libraries. Every module carries
-learning comments describing not just *what* it does but *why* real servers
-do it that way.
+Drop **`include/cttp.h`** into your project, write your handlers, compile. That's the
+whole deal (stb-style header: the same file is the declarations *and* the
+implementation — `#define CTTP_IMPLEMENTATION` once to compile the server code in).
 
-## Build & run
+```c
+#define CTTP_IMPLEMENTATION
+#include "cttp.h"
+
+static void user(http_request *req, http_response *res) {
+    char json[128];
+    snprintf(json, sizeof json, "{\"id\":\"%s\"}", req_param(req, "id"));
+    http_res_json(res, 200, json);
+}
+
+int main(void) {
+    server s;
+    server_init(&s, "127.0.0.1", 8080, NULL);          /* NULL => no static dir */
+    server_route(&s, HTTP_GET, "/users/:id", user);
+    server_run(&s);        /* until SIGINT/SIGTERM */
+    server_free(&s);
+}
+```
 
 ```sh
-make              # clang -std=c11 -Wall -Wextra
-./cttp            # serves public/ on http://127.0.0.1:8080
-./cttp -p 9000 -r ./public -a 0.0.0.0 -t 30
+clang -Iinclude your-server.c -o your-server     # that's it, no other dependencies
 ```
 
-## Learning path (read in this order)
+## Examples
 
-| # | File       | What you learn |
-|---|------------|----------------|
-| 1 | `src/cttp.h` | Data model: request, response, connection, route |
-| 2 | `src/buf.c`  | Growable buffers — why sockets need them |
-| 3 | `src/http.c` | Incremental parsing, Content-Length & chunked bodies, `Expect: 100-continue`, response assembly, HEAD/204/304 |
-| 4 | `src/router.c` | Path routing with `:param` captures, 405 with `Allow:`, OPTIONS |
-| 5 | `src/static.c` | MIME types, ETag/If-None-Match 304s, byte ranges (206/416), traversal protection |
-| 6 | `src/server.c` | The `poll()` event loop, non-blocking I/O, graceful shutdown, idle reaping |
-| 7 | `src/main.c` | Wiring: config parsing and demo handlers |
-
-### The one diagram that explains everything
-
-```
-                 poll() event loop (single thread)
-  accept ─┐        ┌─ CONN_READ_HEADERS ─ incremental parser
-          ├─ conn ─┼─ CONN_READ_BODY / _CHUNK ─┐ parse → route → handler
-          └        └─ CONN_WRITE (flush out)  ─┘        └─ keep-alive ↺
-```
-
-Each TCP connection is a small state machine living in `conn`. The event loop
-never blocks: `read()`/`write()`/`accept()` return `EAGAIN` when the kernel
-buffer is full/empty and we simply resume when `poll()` next reports the
-socket is ready. This is how nginx-style servers get "one connection per
-granted event" with almost no threads.
-
-## Features
-
-- HTTP/1.1, HTTP/1.0; keep-alive + pipelining tolerance
-- Incremental request parsing with configurable header (16 KB) and body (10 MB) limits
-- `Content-Length` bodies and **chunked** request decoding (RFC 9112 §7.1 state machine)
-- `Expect: 100-continue` early acknowledgement (headers-only, then body)
-- Methods GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH
-- Router with `:param` captures, path-scoped 405s with `Allow:`, JSON errors
-- Static files with ~20 MIME types, directory `index.html`, ETag + `If-None-Match`
-  → 304, `Range: bytes=…` → 206 (resumable downloads / media seeking), 416 on bad ranges
-- Streaming chunked **responses** (`GET /api/stream`)
-- Malformed requests → 400/501/505; timeouts; SIGINT/SIGTERM graceful exit; SIGPIPE-safe writes
-- Security guardrails: path traversal rejection, `TCP_NODELAY`, no unbounded buffers
-
-## Try it
+| example | what it demonstrates | port |
+|---|---|---|
+| `examples/01_hello.c` | minimal server | 8081 |
+| `examples/02_rest_api.c` | REST routes, `:params`, POST bodies, 201/204 | 8082 |
+| `examples/03_static_site.c` | serving a folder (MIME, ETag 304, Range 206) | 8083 |
+| `examples/04_echo.c` | req inspection: bodies, headers, all methods | 8084 |
+| `examples/05_streaming.c` | chunked transfer-encoding responses | 8085 |
 
 ```sh
-curl http://127.0.0.1:8080/                 # static index.html
-curl http://127.0.0.1:8080/api/hello        # JSON
-curl http://127.0.0.1:8080/api/users/42     # route params
-curl -d 'hi' http://127.0.0.1:8080/api/echo # echo request body
-curl http://127.0.0.1:8080/api/stream       # chunked streaming
-curl -r 0-99 http://127.0.0.1:8080/         # byte range (206)
-curl -I http://127.0.0.1:8080/                 # HEAD
-printf "BAD\r\n\r\n" | nc 127.0.0.1 8080   # see a 400
+make            # builds every example into build/
+./build/02_rest_api &
+curl -d '{"name":"Ada"}' http://127.0.0.1:8082/users
 ```
 
-## The two bugs you would have hit (we did)
+## API surface
 
-1. **Blocking accept** — the listening socket must also be `O_NONBLOCK`, or
-   the `accept()` loop stalls the entire server after the first client.
-   (Found with `sample` on the hung process: it sat in `__accept`.)
-2. **Static interest** — `poll()` events are read-modify-write: once a
-   response is pending you must add `POLLOUT`, or the kernel will never wake
-   you to flush. This is the event-loop contract most tutorials skip.
+Types: `server`, `http_request`, `http_response`, `http_method`
 
-## Going further (good exercises)
+```c
+int  server_init(server*, const char *host, int port, const char *webroot);
+int  server_route(server*, http_method, const char *pattern, http_handler);
+void server_run(server*);          /* event loop */
+void server_free(server*);
 
-- epoll/kqueue backends behind the same loop (Linux/BSD speedups)
-- Thread pool + concurrent handlers for blocking work (DB, templating)
-- `If-Modified-Since`, last-write wins; multipart/form parsing; TLS (handshake first
-  at accept, then feed into the same parser); HTTP/1.1 101 Upgrade → WebSocket;
-- slowloris mitigation via request-rate accounting; `sendfile()` zero-copy.
+/* inside handlers */
+void http_res_json(http_response*, int status, const char *json);
+void http_res_text(http_response*, int status, const char *text);
+void http_res_set (http_response*, int status, const char *ctype,
+                   const void *body, size_t len);
+const char *req_param(const http_request*, const char *name);
+req->get_header(req, "Content-Type");   /* helper on every request */
+```
+
+See `docs/API.md` for the full list, `docs/INTERNALS.md` — a guided tour of
+the event loop, parsing, chunked encoding and static-file caching — with the
+fully commented sources in **`internals/`**.
+
+## Status / limits (by design)
+
+HTTP/1.1 (+1.0), keep-alive, incremental parsing, chunked bodies in and out,
+`Expect: 100-continue`, byte ranges, ETags, 16 KB header / 10 MB body caps,
+SIGINT/SIGTERM graceful shutdown. No TLS, no threads — the "next steps"
+section of `docs/INTERNALS.md` covers those exercises.

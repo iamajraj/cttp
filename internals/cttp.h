@@ -34,7 +34,7 @@
 #define CT_MAX_ROUTES     64
 #define CT_MAX_PARAM_STR  128
 
-/* ---- HTTP methods we understand ---------------------------------------- */
+/* ---- HTTP methods the server understands --------------------------------- */
 typedef enum {
     HTTP_GET, HTTP_HEAD, HTTP_POST, HTTP_PUT,
     HTTP_DELETE, HTTP_OPTIONS, HTTP_PATCH, HTTP_UNKNOWN
@@ -113,7 +113,7 @@ typedef struct conn {
     long long  chunk_rem;         /* bytes left in current chunk        */
     int        chunk_stage;       /* chunk state machine step           */
     int        expect_continue;   /* client sent Expect: 100-continue   */
-    int        want_continue;     /* we still owe the client a 100      */
+    int        want_continue;     /* a 100 Continue is still owed      */
     int        keep_alive;        /* decided when response finalized    */
     conn_state next_state;        /* state to enter after flushing out  */
 } conn;

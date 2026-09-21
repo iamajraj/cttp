@@ -1,1 +1,6 @@
+# build artifacts
+build/
+*.o
+*.dSYM
 cttp
+example

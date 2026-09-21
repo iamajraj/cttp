@@ -58,7 +58,7 @@ static int route_match(const route *rt, const http_request *r)
     }
 
     /* path matched — copy captured params into a mutable view of the
-     * request (we know it's really ours, so drop const deliberately) */
+     * request: the comment says what happened — drop const deliberately */
     http_request *rw = (http_request *)r;
     memcpy(rw->params,  tmp.params,  sizeof rw->params);
     memcpy(rw->pvalues, tmp.pvalues, sizeof rw->pvalues);

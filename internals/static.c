@@ -53,7 +53,7 @@ static const char *mime_for(const char *path)
     return "application/octet-stream";
 }
 
-/* Reject traversal attempts. The path lives inside c->in, which we never
+/* Reject traversal attempts. The path lives inside c->in, which is never
  * write raw to the socket, but it DOES end up in open() — so ".." and
  * NUL-ish shenanigans must be rejected before the filesystem call. */
 static int is_unsafe_path(const char *p)
@@ -107,7 +107,7 @@ void static_serve(server *s, http_request *req, http_response *res)
     if (fd < 0) { http_res_error(res, 404, "resource not found"); return; }
     struct stat st;
     fstat(fd, &st);
-    if (S_ISDIR(st.st_mode)) {           /* we hit /dir (no slash in URL) */
+    if (S_ISDIR(st.st_mode)) {/* is a directory: retry with trailing-slash convention */
         close(fd);
         snprintf(path, sizeof path, "%s%s/index.html", s->webroot, req->path);
         fd = open(path, O_RDONLY);

@@ -1,7 +1,7 @@
 /* ==========================================================================
  * buf.c — a growable byte buffer.
  *
- * Why do we need this? Sockets deliver data in unpredictable chunk sizes,
+ * Why is this needed? Sockets deliver data in unpredictable chunk sizes,
  * and an HTTP message can arrive over many read() calls. We need somewhere
  * to accumulate bytes until a full message is present — that's this struct.
  * It is also used to build outgoing responses before writing them.

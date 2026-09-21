@@ -214,7 +214,7 @@ static void http_finalize_response(conn *c, server *s, http_response *res)
         buf_append_str(o, "0\r\n\r\n");
     } else if (!res->head_only) {
         /* HEAD: emit headers only — but Content-Length above already
-         * reflects what a GET would return, so we must not append body. */
+         * reflects what a GET would return, so the body must not be appended. */
         buf_append(o, res->body.data, res->body.len);
     }
 
@@ -276,7 +276,7 @@ static int parse_headers(conn *c)
     size_t block_len = (size_t)(end - data) + 4;
     if (block_len > CT_MAX_HEADER_SZ) return -1;
 
-    /* 2. Scratch copy so we can NUL-terminate lines in place. */
+    /* 2. Scratch copy: NUL-terminated lines are parsed in place. */
     char *block = malloc(block_len + 1);
     memcpy(block, data, block_len);
     block[block_len] = '\0';
@@ -319,7 +319,7 @@ static void send_continue_100(conn *c)
 {
     buf_append_str(&c->out, "HTTP/1.1 100 Continue\r\n\r\n");
     c->want_continue = 1;
-    c->next_state = c->state;      /* resume where we left off */
+    c->next_state = c->state;      /* resume where the parse left off */
     c->state = CONN_WRITE;
 }
 
