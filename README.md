@@ -1,74 +1,69 @@
 # cttp — build HTTP APIs in C with one file
 
-Drop **`include/cttp.h`** into your project, write your handlers, compile. That's the
-whole deal (stb-style header: the same file is the declarations *and* the
-implementation — `#define CTTP_IMPLEMENTATION` once to compile the server code in).
+Drop **`include/cttp.h`** into your project, `#define CTTP_IMPLEMENTATION`
+once, write handlers, compile. No dependencies, no build step.
 
 ```c
 #define CTTP_IMPLEMENTATION
 #include "cttp.h"
 
-static void user(http_request *req, http_response *res) {
-    char json[128];
-    snprintf(json, sizeof json, "{\"id\":\"%s\"}", req_param(req, "id"));
-    http_res_json(res, 200, json);
+static void user(cttp_request *req, cttp_response *res) {
+    cttp_json_begin(res);
+    cttp_json_str(res, "id", cttp_param(req, "id"));
+    cttp_json_str(res, "name", cttp_query(req, "name"));
+    cttp_json_end(res, 200);
 }
 
 int main(void) {
-    server s;
-    server_init(&s, "127.0.0.1", 8080, NULL);          /* NULL => no static dir */
-    server_route(&s, HTTP_GET, "/users/:id", user);
-    server_run(&s);        /* until SIGINT/SIGTERM */
-    server_free(&s);
+    cttp_server srv;
+    cttp_init(&srv);                    /* defaults: 127.0.0.1:8080 */
+    srv.webroot = "public";             /* optional static files    */
+    cttp_get(&srv, "/api/users/:id", user);
+    cttp_listen(&srv);                  /* blocks until Ctrl+C      */
+    cttp_free(&srv);
 }
 ```
 
 ```sh
-clang -Iinclude your-server.c -o your-server     # that's it, no other dependencies
+clang -Iinclude your-server.c -o your-server     # that's the whole build
 ```
+
+## Helper functions
+
+| area | helpers |
+|---|---|
+| request | `cttp_header` `cttp_param` `cttp_query` `cttp_query_has` `cttp_form` `cttp_cookie` `cttp_req_id` |
+| response | `cttp_send` `cttp_text` `cttp_html` (printf-style!) `cttp_no_content` `cttp_redirect` `cttp_set_header` `cttp_set_cookie`/`cttp_delete_cookie` `cttp_etag` `cttp_cache` `cttp_cors` `cttp_attachment` `cttp_json_err` |
+| JSON | `cttp_json_begin` `cttp_json_str/int/double/bool/null/raw` `cttp_json_arr/obj_begin/end` `cttp_json_end` — full string escaping, no snprintf |
+| SSE | `cttp_sse_start` `cttp_sse_send` — real push streaming |
+| utilities | `cttp_url_decode` `cttp_url_encode` `cttp_trim` `cttp_streq_i` `cttp_http_date` `cttp_parse_http_date` `cttp_status_text` |
+
+Carbon features in the engine: percent-decoded paths/queries/params,
+wildcard route segments (`/files/*`), middleware chain (`cttp_use`),
+custom 404 (`cttp_on_error`), access logs (`cttp_on_log`), automatic
+X-Request-Id, keep-alive + pipelining, chunked TE both ways,
+`Expect: 100-continue`, ETag 304s, byte ranges (206/416), 413/400/405/501
+handling, graceful shutdown, cookie/form/query parsing.
 
 ## Examples
 
 | example | what it demonstrates | port |
 |---|---|---|
-| `examples/01_hello.c` | minimal server | 8081 |
-| `examples/02_rest_api.c` | REST routes, `:params`, POST bodies, 201/204 | 8082 |
-| `examples/03_static_site.c` | serving a folder (MIME, ETag 304, Range 206) | 8083 |
-| `examples/04_echo.c` | req inspection: bodies, headers, all methods | 8084 |
-| `examples/05_streaming.c` | chunked transfer-encoding responses | 8085 |
+| `examples/01_hello.c` | minimal server, params, query | 8081 |
+| `examples/02_rest_api.c` | REST routes, 201/204, JSON escape | 8082 |
+| `examples/03_static_site.c` | folder serving: MIME, ETag 304, Range 206 | 8083 |
+| `examples/04_echo.c` | all request readers: body, form, cookies, headers | 8084 |
+| `examples/05_streaming.c` | chunked + Server-Sent Events | 8085 |
+| `examples/06_notes_api.c` | middleware, cookies, query, redirect, wildcard, custom 404 | 8086 |
 
 ```sh
 make            # builds every example into build/
-./build/02_rest_api &
-curl -d '{"name":"Ada"}' http://127.0.0.1:8082/users
+./build/06_notes_api &
 ```
 
-## API surface
+## Next steps / exercises
 
-Types: `server`, `http_request`, `http_response`, `http_method`
+gzip, multipart/form, Basic auth + base64, TLS, WebSockets, epoll/kqueue —
+`docs/INTERNALS.md` walks all of them.
 
-```c
-int  server_init(server*, const char *host, int port, const char *webroot);
-int  server_route(server*, http_method, const char *pattern, http_handler);
-void server_run(server*);          /* event loop */
-void server_free(server*);
-
-/* inside handlers */
-void http_res_json(http_response*, int status, const char *json);
-void http_res_text(http_response*, int status, const char *text);
-void http_res_set (http_response*, int status, const char *ctype,
-                   const void *body, size_t len);
-const char *req_param(const http_request*, const char *name);
-req->get_header(req, "Content-Type");   /* helper on every request */
-```
-
-See `docs/API.md` for the full list, `docs/INTERNALS.md` — a guided tour of
-the event loop, parsing, chunked encoding and static-file caching — with the
-fully commented sources in **`internals/`**.
-
-## Status / limits (by design)
-
-HTTP/1.1 (+1.0), keep-alive, incremental parsing, chunked bodies in and out,
-`Expect: 100-continue`, byte ranges, ETags, 16 KB header / 10 MB body caps,
-SIGINT/SIGTERM graceful shutdown. No TLS, no threads — the "next steps"
-section of `docs/INTERNALS.md` covers those exercises.
+Compile once: `#define CTTP_IMPLEMENTATION` above `#include "cttp.h"`.

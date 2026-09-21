@@ -1,5 +1,5 @@
 /* ==========================================================================
- * 02_rest_api.c — a small JSON REST API (:params, POST bodies, statuses).
+ * 02_rest_api.c — smallest JSON REST API in cttp: :params, 201, 204.
  *
  * Build:  make && ./build/02_rest_api
  * Try:
@@ -10,50 +10,52 @@
 #define CTTP_IMPLEMENTATION
 #include "cttp.h"
 
-static int next_id = 1;
-
-static void health(http_request *req, http_response *res)
+static void health(cttp_request *req, cttp_response *res)
 {
     (void)req;
-    http_res_json(res, 200, "{\"status\":\"ok\"}");
+    cttp_json_begin(res);
+    cttp_json_str(res, "status", "ok");
+    cttp_json_str(res, "version", CTTP_VERSION);
+    cttp_json_end(res, 200);
 }
 
-static void create_user(http_request *req, http_response *res)
+static int next_id = 1;
+
+static void create_user(cttp_request *req, cttp_response *res)
 {
     int id = next_id++;
-    char json[256];
-    snprintf(json, sizeof json, "{\"id\":%d,\"body\":%.220s}", id,
-             req->body.len ? req->body.data : "{}");
-    http_res_json(res, 201, json);          /* 201 Created */
+    cttp_json_begin(res);
+    cttp_json_int(res, "id", id);
+    cttp_json_str(res, "body", req->body.data);      /* escaped JSON-in */
+    cttp_json_str(res, "name", cttp_form(req, "name"));
+    cttp_json_end(res, 201);                          /* 201 Created */
 }
 
-static void get_user(http_request *req, http_response *res)
+static void get_user(cttp_request *req, cttp_response *res)
 {
-    const char *id = req_param(req, "id");  /* captured from /users/:id */
-    char json[256];
-    snprintf(json, sizeof json, "{\"id\":\"%s\",\"name\":\"demo\"}", id);
-    http_res_json(res, 200, json);
+    cttp_json_begin(res);
+    cttp_json_str(res, "id", cttp_param(req, "id"));
+    cttp_json_str(res, "name", "demo");
+    cttp_json_end(res, 200);
 }
 
-static void delete_user(http_request *req, http_response *res)
+static void delete_user(cttp_request *req, cttp_response *res)
 {
-    (void)req_param(req, "id");
-    res->status = 204;                      /* 204 No Content: no body */
-    res->no_body = 1;
+    (void)cttp_param(req, "id");
+    cttp_no_content(res);                            /* 204, no body */
 }
 
 int main(void)
 {
-    server s;
-    if (server_init(&s, "127.0.0.1", 8082, NULL) != 0)
-        return 1;
+    cttp_server srv;
+    cttp_init(&srv);
+    srv.port = 8082;
 
-    server_route(&s, HTTP_POST,   "/users",     create_user);
-    server_route(&s, HTTP_GET,    "/users/:id", get_user);
-    server_route(&s, HTTP_DELETE, "/users/:id", delete_user);
-    server_route(&s, HTTP_GET,    "/",          health);
+    cttp_get(&srv, "/", health);
+    cttp_post(&srv, "/users", create_user);
+    cttp_get(&srv, "/users/:id", get_user);
+    cttp_delete(&srv, "/users/:id", delete_user);
 
-    server_run(&s);
-    server_free(&s);
-    return 0;
+    cttp_listen(&srv);
+    cttp_free(&srv);
 }

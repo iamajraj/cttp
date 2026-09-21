@@ -1,21 +1,22 @@
 /* ==========================================================================
- * cttp.h — the single header that ties every module together.
+ * cttp.h — public surface of the cttp HTTP server library.
  *
  * READING GUIDE (read the files in this order):
- *   1. cttp.h        -> data structures: request, response, connection.
- *   2. buf.c         -> a growable byte buffer (used everywhere).
- *   3. http.c        -> parsing requests, building responses.
- *   4. router.c      -> URL routing with :parameters.
- *   5. static.c      -> serving files: MIME, ETag, Range, 304.
- *   6. server.c      -> the poll() event loop (the heart of the server).
- *   7. main.c        -> configuration + the demo routes.
+ *   1. cttp.h   -> types: request / response / server / routes.
+ *   2. buf.c    -> growable byte buffer (the memory backbone).
+ *   3. http.c   -> the HTTP/1.1 engine: incremental parsing + responses.
+ *   4. api.c    -> the friendly helpers handlers actually call.
+ *   5. router.c -> URL routes, wildcards, middleware chain.
+ *   6. static.c -> file serving: MIME, ETag, Range.
+ *   7. server.c -> the poll() event loop (the heart).
+ *   8. main.c   -> demo wiring.
  *
- * BIG PICTURE: one process, one thread, non-blocking sockets, a poll()
- * loop. Each TCP connection is a tiny state machine:
+ * BIG PICTURE: one thread, non-blocking sockets, a poll() loop. Every TCP
+ * connection is a tiny state machine:
  *
- *     READ headers -> READ body -> CALL HANDLER -> WRITE response
- *          ^                                                  |
- *          +__________________ keep-alive: loop ______________+
+ *     READ headers -> READ body -> MIDDLEWARE -> ROUTE -> WRITE response
+ *          ^                                                   |
+ *          +__________________ keep-alive: loop _______________+
  * ========================================================================== */
 #ifndef CTTP_H
 #define CTTP_H
@@ -24,168 +25,256 @@
 #include <stdint.h>
 #include <time.h>
 
-/* ==========================================================================
- * buf.h — growable byte buffer.
- * ========================================================================== */
-
-
-
-
-
+/* ---- growable byte buffer (learning source: internals/buf.c) ------------ */
 typedef struct buf {
-    char  *data;    /* malloc'd, always NUL-terminated after every append */
-    size_t len;     /* bytes used (excludes the implicit NUL)             */
-    size_t cap;     /* bytes allocated                                    */
+    char  *data;    /* malloc'd; NUL-terminated whenever we append          */
+    size_t len;     /* bytes used (the NUL is not counted)                  */
+    size_t cap;     /* bytes allocated                                     */
 } buf_t;
 
-void buf_reserve(buf_t *b, size_t need);
-void buf_append(buf_t *b, const void *p, size_t n);
-void buf_append_str(buf_t *b, const char *s);
-void buf_printf(buf_t *b, const char *fmt, ...);
-void buf_consume(buf_t *b, size_t n);   /* drop n leading bytes */
-void buf_free(buf_t *b);
+/* ---- tunables (override with -D before including) ----------------------- */
+#ifndef CTTP_MAX_HEADERS
+#define CTTP_MAX_HEADERS   32          /* headers per request              */
+#endif
+#ifndef CTTP_MAX_HEADER_SZ
+#define CTTP_MAX_HEADER_SZ (16*1024)   /* total header block cap           */
+#endif
+#ifndef CTTP_MAX_BODY_SZ
+#define CTTP_MAX_BODY_SZ   (10*1024*1024) /* request body cap (10 MB)      */
+#endif
+#ifndef CTTP_MAX_PARAMS
+#define CTTP_MAX_PARAMS    8           /* :name captures per route         */
+#endif
+#ifndef CTTP_MAX_ROUTES
+#define CTTP_MAX_ROUTES    64
+#endif
+#ifndef CTTP_MAX_MIDDLEWARE
+#define CTTP_MAX_MIDDLEWARE 16
+#endif
 
-/* ---- tunables ---------------------------------------------------------- */
-#define CT_MAX_HEADERS    32        /* max headers per request            */
-#define CT_MAX_HEADER_SZ  (16*1024) /* cap on the whole header block     */
-#define CT_MAX_BODY_SZ    (10*1024*1024) /* cap on request body (10 MB)  */
-#define CT_MAX_PARAMS     8         /* :name captures per route           */
-#define CT_MAX_ROUTES     64
-#define CT_MAX_PARAM_STR  128
+#define CTTP_VERSION "2.0"
 
-/* ---- HTTP methods the server understands --------------------------------- */
+/* ---- HTTP methods -------------------------------------------------------- */
 typedef enum {
-    HTTP_GET, HTTP_HEAD, HTTP_POST, HTTP_PUT,
-    HTTP_DELETE, HTTP_OPTIONS, HTTP_PATCH, HTTP_UNKNOWN
-} http_method;
+    CTTP_GET, CTTP_HEAD, CTTP_POST, CTTP_PUT,
+    CTTP_DELETE, CTTP_OPTIONS, CTTP_PATCH, CTTP_UNKNOWN
+} cttp_method;
 
-/* ---- an HTTP request --------------------------------------------------- */
-typedef struct http_request {
-    http_method method;
-    char        method_str[10];   /* as sent by the client, e.g. "GET"  */
-    char        target[2048];     /* request line target (raw)          */
-    char        path[1024];       /* target with query string stripped  */
-    char        query[1024];      /* "?a=b" part, without the '?'       */
-    int         version_minor;    /* 0 => HTTP/1.0, 1 => HTTP/1.1       */
+/* ---- an HTTP request ------------------------------------------------------
+ * handers normally use helpers (cttp_header, cttp_param, cttp_query, ...)
+ * rather than touching these fields directly.                             */
+typedef struct cttp_request {
+    cttp_method method;
+    char        method_str[10];   /* "GET" as the client wrote it        */
+    char        target[2048];     /* raw request target                  */
+    char        path[1024];       /* percent-DECODED path, no query      */
+    char        query[1024];      /* raw query string (decode on access) */
+    int         version_minor;    /* 0 => HTTP/1.0, 1 => HTTP/1.1        */
 
-    struct {                    /* headers stored as name/value pairs */
+    struct {                    /* headers as parsed name/value pairs   */
         char name[64];
         char value[768];
-    } headers[CT_MAX_HEADERS];
+    } headers[CTTP_MAX_HEADERS];
     int nheaders;
 
-    buf_t body;                   /* decoded body (Content-Length or    */
-                                  /* chunked transfer decoding done)    */
+    buf_t body;                   /* decoded body (CL or chunked TE)     */
 
-    char params[CT_MAX_PARAMS][64];          /* names of :params        */
-    char pvalues[CT_MAX_PARAMS][CT_MAX_PARAM_STR]; /* and captured values */
+    char params[CTTP_MAX_PARAMS][64];        /* :name of route params    */
+    char pvalues[CTTP_MAX_PARAMS][256];      /* decoded values           */
     int  nparams;
 
-    /* helper: case-insensitive header lookup, NULL if missing */
-    const char *(*get_header)(const struct http_request *, const char *name);
-} http_request;
+    char req_id[24];              /* auto X-Request-Id (cttp_req_id)     */
+    char cookie_buf[2048];        /* decoded cookie pairs workspace      */
+    int  nccookies;               /* parsed cookie count                 */
+    struct { char name[64]; char value[256]; } cookies[16];
 
-/* ---- an HTTP response -------------------------------------------------- */
-typedef struct http_response {
-    int   status;                 /* 200, 404, ...                      */
-    char  ctype[64];              /* Content-Type header value          */
-    buf_t body;                   /* response payload                   */
-    int   chunked;                /* stream body using chunked TE       */
-    int   head_only;              /* HEAD request: send headers only    */
-    int   no_body;                /* 204/304: never send a body         */
-    char  extra_hdr[256];         /* e.g. "Allow: GET, HEAD\r\n"        */
-} http_response;
+    /* engine bookkeeping (do not touch) */
+    int mw_cur;                   /* middleware cursor for cttp_next     */
+    int responded;                /* set by any cttp_* response helper   */
+} cttp_request;
 
-/* A handler fills in the response. Return value is ignored. */
-typedef void (*http_handler)(http_request *req, http_response *res);
+/* ---- an HTTP response ---------------------------------------------------- */
+typedef struct cttp_response {
+    int   status;                 /* 200, 404, ...                       */
+    char  ctype[64];              /* Content-Type for body               */
+    buf_t body;                   /* payload                             */
+    buf_t headers;                /* extra lines: "Name: value\r\n"      */
+    int   chunked;                /* stream as chunked TE                */
+    int   head_only;              /* HEAD: headers only                  */
+    int   no_body;                /* 204/304: no body at all             */
+    int   responded;              /* set by every cttp_* helper          */
 
-const char *req_param(const http_request *r, const char *name);
+    /* streaming writers (SSE) are wired by the engine: */
+    int   stream;                 /* 1 => SSE push mode                  */
+    void (*stream_write)(struct cttp_response *, const void *, size_t);
+    void *stream_handle;          /* engine context (conn*)              */
 
-/* ---- routing ----------------------------------------------------------- */
-typedef struct route {
-    char         pattern[256];    /* e.g. "/api/users/:id"              */
-    http_method  method;
-    http_handler handler;
-} route;
+    /* JSON-builder state (cttp_json_begin/.../cttp_json_end) */
+    int  _jd;                     /* nesting depth                       */
+    int  _jf[8];                  /* per-level "first item?" flags       */
+} cttp_response;
 
-/* ---- one TCP connection ------------------------------------------------ */
+/* A handler fills in the response via the cttp_* helpers. */
+typedef void (*cttp_handler)(cttp_request *req, cttp_response *res);
+
+/* Middleware wraps the rest of the chain: call cttp_next(req,res) to
+ * continue, or just fill `res` yourself and skip it (short-circuit).     */
+typedef void (*cttp_next)(cttp_request *, cttp_response *);
+typedef void (*cttp_middleware)(cttp_request *req, cttp_response *res,
+                                cttp_next next);
+
+/* Cookie options; zero it for sane defaults (Path=/, session cookie).   */
+typedef struct {
+    int         max_age;          /* seconds; <=0 => session cookie      */
+    const char *path;             /* default "/"                        */
+    const char *domain;           /* default: host-only                 */
+    const char *same_site;        /* "Strict"/"Lax"/"None" or NULL      */
+    int         http_only;        /* hide from JS (document.cookie)     */
+    int         secure;           /* HTTPS-only                         */
+} cttp_cookie_opts;
+
+/* ---- the server ---------------------------------------------------------- */
+typedef struct cttp_server {
+    int         listen_fd;        /* the passive listening socket        */
+    char        host[64];
+    int         port;
+    const char *webroot;          /* directory for static files          */
+    int         timeout_secs;     /* idle connections reaped after this  */
+
+    struct pollfd *pfds;          /* parallel arrays pfds[i] <-> conns[i]*/
+    struct conn  **conns;
+    int nconns, cap;
+
+    struct route {                /* pattern e.g. "/api/users/:id"       */
+        char         pattern[256];
+        cttp_method  method;
+        cttp_handler handler;
+    } routes[CTTP_MAX_ROUTES];
+    int nroutes;
+
+    cttp_middleware mw[CTTP_MAX_MIDDLEWARE];
+    int nmw;
+
+    void (*on_error)(cttp_request *, cttp_response *);   /* 404/405 hook */
+    void (*on_log)(const cttp_request *, int status, size_t bytes);
+    long req_counter;             /* for X-Request-Id                    */
+
+    int running;                  /* cleared by SIGINT/SIGTERM           */
+} cttp_server;
+
+/* =============== public API =============== */
+
+/* server.c — lifecycle */
+int  cttp_init(cttp_server *s);                    /* set fields after    */
+int  cttp_route(cttp_server *s, cttp_method m,
+               const char *pattern, cttp_handler h);
+void cttp_get(cttp_server *s, const char *p, cttp_handler h);
+void cttp_head(cttp_server *s, const char *p, cttp_handler h);
+void cttp_post(cttp_server *s, const char *p, cttp_handler h);
+void cttp_put(cttp_server *s, const char *p, cttp_handler h);
+void cttp_delete(cttp_server *s, const char *p, cttp_handler h);
+void cttp_patch(cttp_server *s, const char *p, cttp_handler h);
+void cttp_options(cttp_server *s, const char *p, cttp_handler h);
+void cttp_use(cttp_server *s, cttp_middleware mw);
+void cttp_on_error(cttp_server *s, void (*h)(cttp_request*, cttp_response*));
+void cttp_on_log(cttp_server *s,
+                 void (*h)(const cttp_request *, int status, size_t bytes));
+void cttp_listen(cttp_server *s);                  /* blocks              */
+void cttp_free(cttp_server *s);
+
+/* api.c — request helpers */
+const char *cttp_header(const cttp_request *r, const char *name);
+const char *cttp_param(const cttp_request *r, const char *name);
+const char *cttp_query(const cttp_request *r, const char *key);
+int         cttp_query_has(const cttp_request *r, const char *key);
+const char *cttp_form(const cttp_request *r, const char *key);
+const char *cttp_cookie(const cttp_request *r, const char *name);
+const char *cttp_req_id(const cttp_request *r);
+
+/* api.c — response builders */
+void cttp_send(cttp_response *r, int status, const char *ctype,
+               const void *body, size_t len);
+void cttp_text(cttp_response *r, int status, const char *fmt, ...);
+void cttp_html(cttp_response *r, int status, const char *fmt, ...);
+void cttp_no_content(cttp_response *r);
+void cttp_redirect(cttp_response *r, int code, const char *location);
+void cttp_set_header(cttp_response *r, const char *name, const char *value);
+void cttp_set_cookie(cttp_response *r, const char *name, const char *value,
+                     const cttp_cookie_opts *opts);
+void cttp_delete_cookie(cttp_response *r, const char *name);
+void cttp_etag(cttp_response *r, const char *tag);
+void cttp_cache(cttp_response *r, int max_age_secs);
+void cttp_cors(cttp_response *r, const char *origin,
+               const char *methods, const char *headers);
+void cttp_attachment(cttp_response *r, const char *filename);
+void cttp_json_err(cttp_response *r, int status, const char *msg);
+
+/* api.c — JSON builder with escaping */
+void cttp_json_begin(cttp_response *r);
+void cttp_json_str(cttp_response *r, const char *key, const char *val);
+void cttp_json_int(cttp_response *r, const char *key, long long v);
+void cttp_json_double(cttp_response *r, const char *key, double v);
+void cttp_json_bool(cttp_response *r, const char *key, int v);
+void cttp_json_null(cttp_response *r, const char *key);
+void cttp_json_raw(cttp_response *r, const char *key, const char *raw);
+void cttp_json_obj_begin(cttp_response *r, const char *key);
+void cttp_json_obj_end(cttp_response *r);
+void cttp_json_arr_begin(cttp_response *r, const char *key);
+void cttp_json_arr_end(cttp_response *r);
+void cttp_json_end(cttp_response *r, int status);
+
+/* api.c — SSE push streaming */
+void cttp_sse_start(cttp_response *r);
+void cttp_sse_send(cttp_response *r, const char *event, const char *data);
+
+/* api.c — URL & string & date utilities */
+int         cttp_url_decode(char *dst, size_t n, const char *src, int plus);
+const char *cttp_url_encode(char *dst, size_t n, const char *src);
+const char *cttp_trim(char *s);
+int         cttp_streq_i(const char *a, const char *b);
+void        cttp_http_date(char *out, size_t n, time_t t);
+time_t      cttp_parse_http_date(const char *s);
+const char *cttp_status_text(int code);
+
+/* logging (log.c) */
+void cttp_log_info(const char *fmt, ...);
+void cttp_log_error(const char *fmt, ...);
+
+/* ---- engine internals (do not use in handlers) --------------------------- */
 typedef enum {
-    CONN_READ_HEADERS,            /* accumulating the header block      */
-    CONN_READ_BODY,               /* accumulating content-length body   */
-    CONN_READ_CHUNK,              /* decoding chunked transfer encoding */
-    CONN_WRITE,                   /* flushing response bytes out        */
-    CONN_CLOSED
+    CONN_READ_HEADERS, CONN_READ_BODY, CONN_READ_CHUNK,
+    CONN_WRITE, CONN_CLOSED
 } conn_state;
 
 typedef struct conn {
-    int        fd;
-    conn_state state;
-    buf_t      in;                /* bytes read but not yet consumed    */
-    buf_t      out;               /* response bytes not yet sent        */
-    size_t     out_off;           /* index into out[] already sent      */
-    time_t     last_activity;     /* for idle timeouts                  */
-
-    http_request req;             /* request being built for this conn  */
-
-    /* body accounting, used by the read-body state machine */
-    long long  body_remaining;    /* for content-length bodies          */
-    long long  chunk_rem;         /* bytes left in current chunk        */
-    int        chunk_stage;       /* chunk state machine step           */
-    int        expect_continue;   /* client sent Expect: 100-continue   */
-    int        want_continue;     /* a 100 Continue is still owed      */
-    int        keep_alive;        /* decided when response finalized    */
-    conn_state next_state;        /* state to enter after flushing out  */
+    int           fd;
+    conn_state    state;
+    buf_t         in;               /* read but not yet parsed            */
+    buf_t         out;              /* response bytes not yet sent        */
+    size_t        out_off;          /* how much of out[] is sent          */
+    time_t        last_activity;
+    cttp_request  req;
+    long long     body_remaining;
+    long long     chunk_rem;
+    int           chunk_stage;
+    int           expect_continue;
+    int           want_continue;
+    int           keep_alive;
+    int           streamed;        /* SSE stream already opened          */
+    conn_state    next_state;
 } conn;
 
-/* ---- server ------------------------------------------------------------ */
-typedef struct server {
-    int         listen_fd;        /* the passive listening socket       */
-    char        host[64];
-    int         port;
-    const char *webroot;          /* directory for static files         */
-
-    struct pollfd *pfds;          /* parallel arrays: pfds[i] <-> conns[i] */
-    conn        **conns;
-    int nconns, cap;
-
-    route routes[CT_MAX_ROUTES];
-    int   nroutes;
-
-    int timeout_secs;             /* idle connections are reaped after  */
-    int running;                  /* cleared by SIGINT/SIGTERM          */
-} server;
-
-/* ---- public API (one prototype per module) ----------------------------- */
-/* server.c */
-int  server_init(server *s, const char *host, int port, const char *webroot);
-int  server_route(server *s, http_method m, const char *pattern, http_handler h);
-void server_run(server *s);
-void server_free(server *s);
-void server_shutdown(server *s);          /* signal-safe: sets running=0  */
-
-/* http.c */
-int  http_read_step(conn *c, server *s);  /* one state-machine step       */
-void http_init_request(http_request *r);
-void http_free_request(http_request *r);
-void http_res_init(http_response *r);
-void http_res_free(http_response *r);
-void http_res_set(http_response *r, int status, const char *ctype,
-                  const void *body, size_t len);
-void http_res_text(http_response *r, int status, const char *text);
-void http_res_json(http_response *r, int status, const char *json);
-void http_res_error(http_response *r, int status, const char *msg);
-const char *http_status_text(int code);
-
-/* router.c */
-void router_dispatch(server *s, http_request *req, http_response *res,
-                     const char *realpath_used);
-
-/* static.c */
-void static_serve(server *s, http_request *req, http_response *res);
-
-/* log.c */
-void log_info(const char *fmt, ...);
-void log_error(const char *fmt, ...);
+int  http_read_step(conn *c, cttp_server *s);
+void http_init_request(cttp_request *r);
+void http_free_request(cttp_request *r);
+void http_finalize_response(conn *c, cttp_server *s, cttp_response *r);
+void router_dispatch(cttp_server *s, cttp_request *req, cttp_response *res);
+void static_serve(cttp_server *s, cttp_request *req, cttp_response *res);
+void buf_append(buf_t *b, const void *p, size_t n);
+void buf_append_str(buf_t *b, const char *s);
+void buf_printf(buf_t *b, const char *fmt, ...);
+void buf_consume(buf_t *b, size_t n);
+void buf_free(buf_t *b);
 
 #endif /* CTTP_H */
 
@@ -194,23 +283,27 @@ void log_error(const char *fmt, ...);
 
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <poll.h>
 /* ==== from internals/buf.c ==== */
 /* ==========================================================================
- * buf.c — a growable byte buffer.
+ * buf.c — growable byte buffer.
  *
- * Why is this needed? Sockets deliver data in unpredictable chunk sizes,
- * and an HTTP message can arrive over many read() calls. We need somewhere
- * to accumulate bytes until a full message is present — that's this struct.
- * It is also used to build outgoing responses before writing them.
+ * Sockets deliver data in unpredictable chunk sizes, and an HTTP message
+ * may arrive over many read() calls. Somewhere must accumulate bytes until
+ * a full message exists — that is this struct (and it also builds every
+ * outgoing response before writing).
+ *
+ * buf_printf is UNBOUNDED printf-to-buffer: it sizes the output first, so
+ * handlers never need snprintf() (which forces fixed sizes on the caller).
  * ========================================================================== */
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <stdarg.h>
 
 
 
-/* Ensure capacity for at least 'need' more bytes, amortized doubling. */
+/* Guarantee room for `need` more bytes (amortized doubling). */
 void buf_reserve(buf_t *b, size_t need)
 {
     if (b->len + need + 1 <= b->cap) return;
@@ -221,8 +314,8 @@ void buf_reserve(buf_t *b, size_t need)
     b->cap = newcap;
 }
 
-/* Append raw bytes. Always keeps data NUL-terminated for convenience,
- * although the NUL is NOT counted in ->len (binary-safe). */
+/* Append raw bytes. Always NUL-terminates (not counted in len) so the
+ * buffer can be passed straight to strcmp & friends: binary-safe. */
 void buf_append(buf_t *b, const void *p, size_t n)
 {
     if (n == 0) return;
@@ -234,19 +327,29 @@ void buf_append(buf_t *b, const void *p, size_t n)
 
 void buf_append_str(buf_t *b, const char *s) { buf_append(b, s, strlen(s)); }
 
-void buf_printf(buf_t *b, const char *fmt, ...)
+/* printf-style append that grows the buffer to fit. */
+void buf_vappendf(buf_t *b, const char *fmt, va_list ap)
 {
-    char tmp[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
-    va_end(ap);
-    if (n > 0) buf_append(b, tmp, (size_t)n);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);     /* measure first */
+    va_end(ap2);
+    if (n < 0) return;
+    buf_reserve(b, (size_t)n);
+    vsnprintf(b->data + b->len, (size_t)n + 1, fmt, ap);
+    b->len += (size_t)n;
 }
 
-/* Discard the first n bytes (memmove the rest to the front).
- * Used when we've finished parsing a message out of the read buffer and
- * want to keep any leftover bytes that belong to the next request. */
+void buf_printf(buf_t *b, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    buf_vappendf(b, fmt, ap);
+    va_end(ap);
+}
+
+/* Discard the first n bytes (used when a message is fully parsed and we
+ * keep leftover bytes that belong to the next pipelined request). */
 void buf_consume(buf_t *b, size_t n)
 {
     if (n >= b->len) { b->len = 0; if (b->data) b->data[0] = '\0'; return; }
@@ -264,7 +367,7 @@ void buf_free(buf_t *b)
 
 /* ==== from internals/log.c ==== */
 /* ==========================================================================
- * log.c — tiny timestamped logger.
+ * log.c — tiny timestamped logger (stderr). Swap vlog() for anything.
  * ========================================================================== */
 #include <stdarg.h>
 #include <stdio.h>
@@ -277,20 +380,21 @@ static void vlog(const char *tag, const char *fmt, va_list ap)
     char ts[32];
     time_t now = time(NULL);
     struct tm tm;
-    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime_r(&now, &tm));
+    localtime_r(&now, &tm);
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
     fprintf(stderr, "[%s] %s ", ts, tag);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
 }
 
-void log_info(const char *fmt, ...)
+void cttp_log_info(const char *fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
     vlog("INFO", fmt, ap);
     va_end(ap);
 }
 
-void log_error(const char *fmt, ...)
+void cttp_log_error(const char *fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
     vlog("ERROR", fmt, ap);
@@ -298,35 +402,519 @@ void log_error(const char *fmt, ...)
 }
 
 
-/* ==== from internals/http.c ==== */
+/* ==== from internals/api.c ==== */
 /* ==========================================================================
- * http.c — HTTP/1.1 parsing and response building.
+ * api.c — the helper layer handlers call. No snprintf required anywhere.
  *
- * The core protocol module. Per connection it drives a small state machine:
- *
- *   CONN_READ_HEADERS -> CONN_READ_BODY(/CHUNK) -> [router] -> CONN_WRITE
- *
- * Everything is incremental: a request may arrive in tiny TCP segments, so
- * parsing works on whatever bytes are currently in conn->in, consuming only
- * the complete parts and leaving the rest for later calls.
+ * Three groups live here:
+ *   1. request accessors (param / query / form / cookie / request id)
+ *   2. response builders (text/json/redirect/cookies/cors/...)
+ *   3. JSON builder + SSE push streaming + small utilities
  * ========================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>   /* strcasecmp, strncasecmp (POSIX) */
+#include <strings.h>
+#include <stdarg.h>
 #include <time.h>
-#include <errno.h>
 
 
 
-/* Step results for the server loop. */
+/* ==== request accessors ==================================================== */
+
+/* Value captured for a ":name" parameter of the matched route. */
+const char *cttp_param(const cttp_request *r, const char *name)
+{
+    for (int i = 0; i < r->nparams; i++)
+        if (strcmp(r->params[i], name) == 0)
+            return r->pvalues[i];
+    return NULL;
+}
+
+/* Split the next "a=b" pair of a query/form/cookie string into decoded
+ * key and value. Returns 1 on read, 0 when the string is exhausted.
+ * Sections are separated by '&' (or ';' for cookies, chosen by caller
+ * passing sep). '+' => space only when `plus` is set (query & forms; a
+ * real space in a cookie value would appear as %20 instead).            */
+static int next_pair(const char **cursor, char sep1, char sep2,
+                     char *key, size_t kn, char *val, size_t vn, int plus)
+{
+    const char *p = *cursor;
+    while (p && (*p == sep1 || *p == sep2)) p++;      /* skip separators */
+    if (!p || !*p) { *cursor = p; return 0; }
+
+    const char *end = p;
+    while (*end && *end != sep1 && *end != sep2) end++;
+
+    const char *eq = memchr(p, '=', (size_t)(end - p));
+    if (eq) {
+        char keyraw[128];
+        size_t klen = (size_t)(eq - p);
+        if (klen >= kn) klen = kn - 1;
+        memcpy(keyraw, p, klen);
+        keyraw[klen] = '\0';
+        cttp_url_decode(key, kn, keyraw, plus);
+
+        char valraw[512];
+        size_t vlen = (size_t)(end - (eq + 1));
+        if (vlen >= vn) vlen = vn - 1;
+        memcpy(valraw, eq + 1, vlen);
+        valraw[vlen] = '\0';
+        cttp_url_decode(val, vn, valraw, plus);
+    } else {
+        snprintf(key, kn, "%.*s", (int)(end - p), p);
+        cttp_url_decode(key, kn, key, plus);
+        cttp_trim(key);
+        val[0] = '\0';
+    }
+
+    *cursor = end;
+    return 1;
+}
+
+/* Query strings: "?name=Ada%20L&q=1". We scan on demand and decode into
+ * one of two rotating scratch slots (headers are read-only structs). */
+const char *cttp_query(const cttp_request *r, const char *key)
+{
+    static char out[2][256];
+    static int slot;
+    slot ^= 1;
+    const char *cur = r->query;
+    char k[64], v[256];
+    while (next_pair(&cur, '&', '&', k, sizeof k, v, sizeof v, 1))
+        if (strcmp(k, key) == 0)
+            return (snprintf(out[slot], sizeof out[slot], "%s", v),
+                    out[slot]);
+    return NULL;
+}
+
+int cttp_query_has(const cttp_request *r, const char *key)
+{
+    return cttp_query(r, key) != NULL;
+}
+
+/* Form bodies: "Content-Type: application/x-www-form-urlencoded" with
+ * the same a=b&c=d shape as a query string, arriving as the body. */
+const char *cttp_form(const cttp_request *r, const char *key)
+{
+    static char out[2][512];
+    static int slot;
+    if (!r->body.data) return NULL;
+    const char *ct = cttp_header(r, "Content-Type");
+    if (!ct || !cttp_streq_i(ct, "application/x-www-form-urlencoded"))
+        return NULL;
+    slot ^= 1;
+    const char *cur = r->body.data;
+    char k[64], v[256];
+    while (next_pair(&cur, '&', '&', k, sizeof k, v, sizeof v, 1))
+        if (strcmp(k, key) == 0)
+            return (snprintf(out[slot], sizeof out[slot], "%s", v),
+                    out[slot]);
+    return NULL;
+}
+
+/* Cookies: "Cookie: a=1; b=2" — parsed once per request, then cached. */
+const char *cttp_cookie(const cttp_request *r, const char *name)
+{
+    /* NOTE: r is const, so parse caches live in the request struct cast
+     * away — same trick the router uses for params. */
+    cttp_request *rw = (cttp_request *)r;
+    if (rw->nccookies < 0) {
+        const char *h = cttp_header(r, "Cookie");
+        rw->nccookies = 0;
+        const char *cur = h ? h : "";
+        char k[64], v[256];
+        while (rw->nccookies < 16 &&
+               next_pair(&cur, ';', ';', k, sizeof k, v, sizeof v, 0)) {
+            snprintf(rw->cookies[rw->nccookies].name,  64, "%s", k);
+            snprintf(rw->cookies[rw->nccookies].value, 256, "%s", v);
+            rw->nccookies++;
+        }
+    }
+    for (int i = 0; i < rw->nccookies; i++)
+        if (strcmp(rw->cookies[i].name, name) == 0)
+            return rw->cookies[i].value;
+    return NULL;
+}
+
+const char *cttp_req_id(const cttp_request *r) { return r->req_id; }
+
+/* ==== small string utilities (url-decode lives in http.c) ==== */
+/* Case-insensitive string equality (headers live up to RFC 9110 §5.1). */
+int cttp_streq_i(const char *a, const char *b)
+{
+    return a && b && strcasecmp(a, b) == 0;
+}
+
+/* Trim ASCII whitespace in place; returns the (possibly shifted) start. */
+const char *cttp_trim(char *s)
+{
+    char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    char *e = p + strlen(p);
+    while (e > p && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r'||e[-1]=='\n')) e--;
+    *e = '\0';
+    return p;
+}
+
+/* default case: defined with the JSON builder section, appended here */
+
+/* ==== response builders ==================================================== */
+
+/* anything filling in a response marks it: middleware stops right here */
+static void responded(cttp_response *r) { r->responded = 1; }
+
+void cttp_send(cttp_response *r, int status, const char *ctype,
+               const void *body, size_t len)
+{
+    r->status = status;
+    snprintf(r->ctype, sizeof r->ctype, "%s", ctype ? ctype : "text/plain");
+    buf_free(&r->body);
+    buf_append(&r->body, body, len);
+    responded(r);
+}
+
+/* printf-style: never a fixed "snprintf then pray" buffer again */
+void cttp_text(cttp_response *r, int status, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    r->status = status;
+    snprintf(r->ctype, sizeof r->ctype, "text/plain; charset=utf-8");
+    buf_free(&r->body);
+    buf_vappendf(&r->body, fmt, ap);
+    va_end(ap);
+    responded(r);
+}
+
+void cttp_html(cttp_response *r, int status, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    r->status = status;
+    snprintf(r->ctype, sizeof r->ctype, "text/html; charset=utf-8");
+    buf_free(&r->body);
+    buf_vappendf(&r->body, fmt, ap);
+    va_end(ap);
+    responded(r);
+}
+
+void cttp_no_content(cttp_response *r)
+{
+    r->status = 204;
+    r->no_body = 1;               /* 204 must never carry a body */
+    responded(r);
+}
+
+void cttp_redirect(cttp_response *r, int code, const char *location)
+{
+    r->status = code;             /* 301/302/307/308 */
+    buf_free(&r->body);
+    cttp_set_header(r, "Location", location);
+    responded(r);
+}
+
+/* Header names are case-insensitive on the wire but must stay token-like:
+ * letters, digits, '-', '_' — anything else is silently dropped so a
+ * handler mistake can't smuggle CRLF into the response.                  */
+static int valid_hdr_name(const char *n)
+{
+    for (const char *p = n; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_'))
+            return 0;
+    return *n != '\0';
+}
+
+void cttp_set_header(cttp_response *r, const char *name, const char *value)
+{
+    if (!valid_hdr_name(name) || strchr(value, '\r') || strchr(value, '\n'))
+        return;                   /* refuse CRLF injection via values    */
+    buf_printf(&r->headers, "%s: %s\r\n", name, value);
+}
+
+void cttp_set_cookie(cttp_response *r, const char *name, const char *value,
+                     const cttp_cookie_opts *opts)
+{
+    cttp_cookie_opts def = {0};
+    if (!opts) opts = &def;
+    buf_printf(&r->headers, "Set-Cookie: %s=%s", name, value);
+    buf_printf(&r->headers, "; Path=%s",
+               opts->path ? opts->path : "/");
+    if (opts->max_age > 0)
+        buf_printf(&r->headers, "; Max-Age=%d", opts->max_age);
+    if (opts->domain)
+        buf_printf(&r->headers, "; Domain=%s", opts->domain);
+    if (opts->same_site)
+        buf_printf(&r->headers, "; SameSite=%s", opts->same_site);
+    if (opts->http_only)
+        buf_append_str(&r->headers, "; HttpOnly");
+    if (opts->secure)
+        buf_append_str(&r->headers, "; Secure");
+    buf_append_str(&r->headers, "\r\n");
+}
+
+void cttp_delete_cookie(cttp_response *r, const char *name)
+{
+    buf_printf(&r->headers,
+               "Set-Cookie: %s=; Path=/; Max-Age=0\r\n", name);
+}
+
+void cttp_etag(cttp_response *r, const char *tag)
+{
+    buf_printf(&r->headers, "ETag: \"%s\"\r\n", tag);
+}
+
+void cttp_cache(cttp_response *r, int max_age_secs)
+{
+    buf_printf(&r->headers, "Cache-Control: max-age=%d\r\n", max_age_secs);
+}
+
+/* CORS: browsers force this dance for cross-origin JS calls.           */
+void cttp_cors(cttp_response *r, const char *origin,
+               const char *methods, const char *headers)
+{
+    cttp_set_header(r, "Access-Control-Allow-Origin", origin ? origin : "*");
+    if (methods)
+        cttp_set_header(r, "Access-Control-Allow-Methods", methods);
+    else
+        cttp_set_header(r, "Access-Control-Allow-Methods",
+                        "GET, HEAD, POST, PUT, DELETE, OPTIONS");
+    if (headers)
+        cttp_set_header(r, "Access-Control-Allow-Headers", headers);
+}
+
+/* Suggest the client download instead of display. */
+void cttp_attachment(cttp_response *r, const char *filename)
+{
+    char safe[256];
+    snprintf(safe, sizeof safe, "%s", filename ? filename : "download");
+    for (char *p = safe; *p; p++)          /* strip quotes/backslashes */
+        if (*p == '"' || *p == '\\') *p = '_';
+    char v[300];
+    snprintf(v, sizeof v, "attachment; filename=\"%s\"", safe);
+    cttp_set_header(r, "Content-Disposition", v);
+}
+
+/* ==== SSE push streaming ==================================================== */
+
+/* Engine hook: wrap data into a wire chunk and queue it for the socket.
+ * (conn is the engine's per-connection state, delivered via stream_handle.) */
+static void stream_write(cttp_response *res, const void *data, size_t len)
+{
+    conn *c = res->stream_handle;
+    if (!c) return;
+    buf_printf(&c->out, "%zx\r\n", len);
+    buf_append(&c->out, data, len);
+    buf_append_str(&c->out, "\r\n");
+    c->state = CONN_WRITE;               /* the loop flushes on POLLOUT */
+}
+
+/* Begin an SSE response: text/event-stream headers immediately, then
+ * each cttp_sse_send call becomes its own delivered chunk.             */
+void cttp_sse_start(cttp_response *res)
+{
+    conn *c = res->stream_handle;
+    if (!c || c->streamed) return;
+    c->streamed = 1;
+    c->keep_alive = (c->req.version_minor >= 1);
+
+    res->status = 200;
+    res->stream = 1;
+    res->responded = 1;
+    snprintf(res->ctype, sizeof res->ctype, "text/event-stream");
+    char date[64];
+    cttp_http_date(date, sizeof date, time(NULL));
+    buf_printf(&c->out,
+        "HTTP/1.1 200 OK\r\nServer: cttp/%s\r\n"
+        "Server-Request-Id: %s\r\nDate: %.64s\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n",
+        CTTP_VERSION, c->req.req_id, date);
+    buf_append(&c->out, res->headers.data, res->headers.len);
+    buf_append_str(&c->out, "\r\n");
+
+    c->state = CONN_WRITE;               /* the loop flushes on POLLOUT */
+}
+
+/* One event: "event: name\ndata: line\nodata...\n\n". Multi-line data
+ * becomes several data: lines, exactly as the SSE spec wants.          */
+void cttp_sse_send(cttp_response *res, const char *event, const char *data)
+{
+    if (!res->stream)
+        cttp_sse_start(res);             /* implicit start if not called */
+
+    buf_t ev = {0};
+    if (event && *event)
+        buf_printf(&ev, "event: %s\n", event);
+    const char *p = data ? data : "";
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        buf_printf(&ev, "data: %.*s\n", (int)len, p);
+        p = nl ? nl + 1 : p + len;
+    }
+    buf_append_str(&ev, "\n");
+    stream_write(res, ev.data, ev.len);
+    buf_free(&ev);
+}
+
+/* ==== JSON builder ========================================================== */
+
+/* JSON string with full escaping — never trust raw concatenation.      */
+static void json_quote(buf_t *b, const char *s)
+{
+    buf_append_str(b, "\"");
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '"':  buf_append_str(b, "\\\""); break;
+        case '\\': buf_append_str(b, "\\\\"); break;
+        case '\n': buf_append_str(b, "\\n");  break;
+        case '\t': buf_append_str(b, "\\t");  break;
+        case '\r': buf_append_str(b, "\\r");  break;
+        case '\b': buf_append_str(b, "\\b");  break;
+        case '\f': buf_append_str(b, "\\f");  break;
+        default:
+            if (*p < 0x20)
+                buf_printf(b, "\\u%04x", *p);
+            else
+                buf_append(b, p, 1);
+        }
+    }
+    buf_append_str(b, "\"");
+}
+
+/* comma bookkeeping per nesting level */
+static void json_key(cttp_response *r, const char *key)
+{
+    if (!r->_jf[r->_jd])
+        buf_append_str(&r->body, ",");
+    r->_jf[r->_jd] = 0;
+    if (key)
+        json_quote(&r->body, key), buf_append_str(&r->body, ":");
+}
+
+void cttp_json_begin(cttp_response *r)
+{
+    buf_free(&r->body);
+    snprintf(r->ctype, sizeof r->ctype, "application/json");
+    r->_jd = 0;
+    r->_jf[0] = 1;
+    buf_append_str(&r->body, "{");
+}
+
+void cttp_json_str(cttp_response *r, const char *key, const char *val)
+{
+    json_key(r, key);
+    if (val) json_quote(&r->body, val);
+    else     buf_append_str(&r->body, "null");
+}
+
+void cttp_json_int(cttp_response *r, const char *key, long long v)
+{
+    json_key(r, key);
+    buf_printf(&r->body, "%lld", v);
+}
+
+void cttp_json_double(cttp_response *r, const char *key, double v)
+{
+    json_key(r, key);
+    buf_printf(&r->body, "%g", v);
+}
+
+void cttp_json_bool(cttp_response *r, const char *key, int v)
+{
+    json_key(r, key);
+    buf_append_str(&r->body, v ? "true" : "false");
+}
+
+void cttp_json_null(cttp_response *r, const char *key)
+{
+    json_key(r, key);
+    buf_append_str(&r->body, "null");
+}
+
+/* Escape hatch: pre-formed fragments, e.g. an array you built by hand. */
+void cttp_json_raw(cttp_response *r, const char *key, const char *raw)
+{
+    json_key(r, key);
+    buf_append_str(&r->body, raw);
+}
+
+void cttp_json_obj_begin(cttp_response *r, const char *key)
+{
+    json_key(r, key);
+    buf_append_str(&r->body, "{");
+    if (r->_jd < 7) r->_jd++;
+    r->_jf[r->_jd] = 1;
+}
+
+void cttp_json_arr_begin(cttp_response *r, const char *key)
+{
+    json_key(r, key);
+    buf_append_str(&r->body, "[");
+    if (r->_jd < 7) r->_jd++;
+    r->_jf[r->_jd] = 1;
+}
+
+void cttp_json_obj_end(cttp_response *r)
+{
+    buf_append_str(&r->body, "}");
+    if (r->_jd > 0) r->_jd--;
+    r->_jf[r->_jd] = 0;
+}
+
+void cttp_json_arr_end(cttp_response *r)
+{
+    buf_append_str(&r->body, "]");
+    if (r->_jd > 0) r->_jd--;
+    r->_jf[r->_jd] = 0;
+}
+
+void cttp_json_end(cttp_response *r, int status)
+{
+    buf_append_str(&r->body, "}");
+    r->status = status;
+    responded(r);
+}
+
+void cttp_json_err(cttp_response *r, int status, const char *msg)
+{
+    cttp_json_begin(r);
+    cttp_json_int(r, "code", status);
+    cttp_json_str(r, "message", msg ? msg : cttp_status_text(status));
+    cttp_json_end(r, status);
+}
+
+
+/* ==== from internals/http.c ==== */
+/* ==========================================================================
+ * http.c — the HTTP/1.1 engine: incremental parsing and response writing.
+ *
+ * Per connection this module drives a small state machine:
+ *
+ *   CONN_READ_HEADERS -> CONN_READ_BODY(/CHUNK) -> [middleware+route] -> WRITE
+ *
+ * Everything is incremental: a request may arrive in tiny TCP segments, so
+ * parsing consumes only fully-arrived parts of conn->in and leaves the
+ * rest untouched for later calls.
+ * ========================================================================== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
+
+
+
+/* step results for the server loop */
 #define STEP_NEED_MORE    0
 #define STEP_RESP_READY   1
 #define STEP_FATAL       -1
 
 /* ---- small helpers ------------------------------------------------------- */
 
-static const char *req_get_header(const http_request *r, const char *name)
+static const char *req_get_header(const cttp_request *r, const char *name)
 {
     for (int i = 0; i < r->nheaders; i++)
         if (strcasecmp(r->headers[i].name, name) == 0)
@@ -334,13 +922,12 @@ static const char *req_get_header(const http_request *r, const char *name)
     return NULL;
 }
 
-/* Is 'token' present in the (case-insensitive) comma-separated list 'v'? */
+/* Is `token` a member of the (case-insensitive) comma list in v? */
 static int has_token(const char *v, const char *token)
 {
     size_t n = strlen(token);
     while (v && *v) {
-        if (strncasecmp(v, token, n) == 0)
-            return 1;
+        if (strncasecmp(v, token, n) == 0) return 1;
         const char *comma = strchr(v, ',');
         if (!comma) return 0;
         v = comma + 1;
@@ -349,31 +936,30 @@ static int has_token(const char *v, const char *token)
     return 0;
 }
 
-static http_method method_from_str(const char *s)
+static cttp_method method_from_str(const char *s)
 {
-    if (!strcmp(s, "GET"))     return HTTP_GET;
-    if (!strcmp(s, "HEAD"))    return HTTP_HEAD;
-    if (!strcmp(s, "POST"))    return HTTP_POST;
-    if (!strcmp(s, "PUT"))     return HTTP_PUT;
-    if (!strcmp(s, "DELETE"))  return HTTP_DELETE;
-    if (!strcmp(s, "OPTIONS")) return HTTP_OPTIONS;
-    if (!strcmp(s, "PATCH"))   return HTTP_PATCH;
-    return HTTP_UNKNOWN;
+    if (!strcmp(s, "GET"))     return CTTP_GET;
+    if (!strcmp(s, "HEAD"))    return CTTP_HEAD;
+    if (!strcmp(s, "POST"))    return CTTP_POST;
+    if (!strcmp(s, "PUT"))     return CTTP_PUT;
+    if (!strcmp(s, "DELETE"))  return CTTP_DELETE;
+    if (!strcmp(s, "OPTIONS")) return CTTP_OPTIONS;
+    if (!strcmp(s, "PATCH"))   return CTTP_PATCH;
+    return CTTP_UNKNOWN;
 }
 
 /* ---- request/response lifecycle ------------------------------------------ */
 
-void http_init_request(http_request *r)
+void http_init_request(cttp_request *r)
 {
     memset(r, 0, sizeof *r);
-    r->get_header = req_get_header;
+    r->nccookies = -1;            /* -1 = "not parsed yet" sentinel */
+    r->mw_cur = -1;               /* middleware cursor              */
 }
 
-void http_free_request(http_request *r) { buf_free(&r->body); }
-void http_res_init(http_response *r)    { memset(r, 0, sizeof *r); r->status = 200; }
-void http_res_free(http_response *r)    { buf_free(&r->body); }
+void http_free_request(cttp_request *r) { buf_free(&r->body); }
 
-const char *http_status_text(int code)
+const char *cttp_status_text(int code)
 {
     switch (code) {
     case 100: return "Continue";
@@ -385,55 +971,27 @@ const char *http_status_text(int code)
     case 302: return "Found";
     case 304: return "Not Modified";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
-    case 411: return "Length Required";
+    case 409: return "Conflict";
     case 413: return "Content Too Large";
     case 416: return "Range Not Satisfiable";
     case 417: return "Expectation Failed";
+    case 422: return "Unprocessable Content";
+    case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
+    case 503: return "Service Unavailable";
     case 505: return "HTTP Version Not Supported";
     default:  return "OK";
     }
 }
 
-/* ---- response builders (used by route handlers) --------------------------- */
-
-void http_res_set(http_response *r, int status, const char *ctype,
-                  const void *body, size_t len)
-{
-    r->status = status;
-    snprintf(r->ctype, sizeof r->ctype, "%s", ctype ? ctype : "text/plain");
-    buf_free(&r->body);
-    buf_append(&r->body, body, len);
-}
-
-void http_res_text(http_response *r, int status, const char *text)
-{
-    http_res_set(r, status, "text/plain; charset=utf-8", text, strlen(text));
-}
-
-void http_res_json(http_response *r, int status, const char *json)
-{
-    http_res_set(r, status, "application/json", json, strlen(json));
-}
-
-void http_res_error(http_response *r, int status, const char *msg)
-{
-    buf_free(&r->body);
-    r->status = status;
-    snprintf(r->ctype, sizeof r->ctype, "application/json");
-    buf_printf(&r->body, "{\"error\":{\"code\":%d,\"message\":\"%s\"}}",
-               status, msg ? msg : http_status_text(status));
-}
-
-/* ---- building the response bytes ------------------------------------------ */
-
-/* RFC 9110 §5.6.7 date: "Sun, 06 Nov 1994 08:49:37 GMT" */
-static void http_gmt_date(char *out, size_t n, time_t t)
+/* RFC 9110 §5.6.7: "Sun, 06 Nov 1994 08:49:37 GMT" */
+void cttp_http_date(char *out, size_t n, time_t t)
 {
     struct tm tm;
     gmtime_r(&t, &tm);
@@ -445,34 +1003,115 @@ static void http_gmt_date(char *out, size_t n, time_t t)
              tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-/* Decision rule for persistence (RFC 9112 §9.3):
- *   HTTP/1.1: persistent by default; close only if client asks.
- *   HTTP/1.0: close by default; persistent only if client asks. */
+time_t cttp_parse_http_date(const char *s)
+{
+    /* Accepts exactly the format our cttp_http_date() emits — enough for
+     * comparing dates we ourselves produced (e.g. Last-Modified). */
+    static const char *mons[] = { "Jan","Feb","Mar","Apr","May","Jun",
+                                  "Jul","Aug","Sep","Oct","Nov","Dec" };
+    struct tm tm = {0};
+    char mon[4] = {0};
+    if (sscanf(s, "%*s %d %3s %d %d:%d:%d",
+               &tm.tm_mday, mon, &tm.tm_year,
+               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6)
+        return 0;
+    for (int i = 0; i < 12; i++)
+        if (strcmp(mon, mons[i]) == 0) { tm.tm_mon = i; break; }
+    tm.tm_year -= 1900;
+    tm.tm_isdst = 0;
+    return timegm(&tm);
+}
+
+/* ---- percent-decoding ------------------------------------------------------
+ * URLs arrive percent-encoded ("%20" for space). Decoding happens once at
+ * parse time so handlers and the router see plain text. Decoding also means
+ * "%2e%2e" becomes ".." BEFORE the traversal check sees it — which is why
+ * the safety check must run on the decoded value (see static.c).
+ * `plus` decodes '+' as space (needed for query strings / forms, not paths). */
+int cttp_url_decode(char *dst, size_t n, const char *src, int plus)
+{
+    size_t o = 0;
+    for (size_t i = 0; src[i]; ) {
+        char c = src[i];
+        if (c == '%' && src[i+1] && src[i+2]) {           /* %XX escape   */
+            char hex[3] = { src[i+1], src[i+2], 0 };
+            char *end;
+            long v = strtol(hex, &end, 16);
+            if (end != hex + 2) return -1;                /* not hex      */
+            c = (char)v;
+            i += 3;
+        } else if (c == '+' && plus) {
+            c = ' '; i++;
+        } else {
+            i++;
+        }
+        if (o + 1 >= n) return -1;                        /* dst too small*/
+        dst[o++] = c;
+    }
+    dst[o] = '\0';
+    return 0;
+}
+
+const char *cttp_url_encode(char *dst, size_t n, const char *src)
+{
+    static const char *hex = "0123456789ABCDEF";
+    size_t o = 0;
+    for (size_t i = 0; src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        int safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') ||
+                   c == '-' || c == '_' || c == '.' || c == '~';
+        if (safe) {
+            if (o + 1 >= n) return NULL;
+            dst[o++] = (char)c;
+        } else {
+            if (o + 3 >= n) return NULL;
+            dst[o++] = '%'; dst[o++] = hex[c >> 4]; dst[o++] = hex[c & 15];
+        }
+    }
+    dst[o] = '\0';
+    return dst;
+}
+
+/* ---- building the response bytes ------------------------------------------
+ * The engine writes: status line, standard headers, then any lines the
+ * handler added via cttp_set_header/cookie/cors (they live in res->headers
+ * as ready-made "Name: value\r\n" lines), then the body (with chunked TE
+ * for streaming, nothing for HEAD / 204 / 304).                              */
+
 static void decide_keep_alive(conn *c)
 {
-    int keep = (c->req.version_minor >= 1);
+    int keep = (c->req.version_minor >= 1);      /* HTTP/1.1 default: yes   */
     const char *h = req_get_header(&c->req, "Connection");
     if (h) {
         if (has_token(h, "close"))      keep = 0;
         if (has_token(h, "keep-alive")) keep = 1;
+    } else if (c->req.version_minor == 0) {
+        keep = 0;
     }
     c->keep_alive = keep;
 }
 
-/* Format the finished response into conn->out and switch to CONN_WRITE.
- * Handles: status line, standard headers, chunked encoding for streaming
- * responses, HEAD (headers only) and no-body statuses (204/304/1xx). */
-static void http_finalize_response(conn *c, server *s, http_response *res)
+void http_finalize_response(conn *c, cttp_server *s, cttp_response *res)
 {
     buf_t *o = &c->out;
     char date[64];
-    http_gmt_date(date, sizeof date, time(NULL));
     (void)s;
 
-    decide_keep_alive(c);
+    /* SSE already sent the header block; only close the chunk stream. */
+    if (c->streamed) {
+        buf_append_str(o, "0\r\n\r\n");
+        cttp_log_info("%s %s -> SSE stream", c->req.method_str, c->req.path);
+        c->state = CONN_WRITE;
+        return;
+    }
 
-    buf_printf(o, "HTTP/1.1 %d %s\r\n", res->status, http_status_text(res->status));
-    buf_printf(o, "Server: cttp/1.0\r\n");
+    decide_keep_alive(c);
+    cttp_http_date(date, sizeof date, time(NULL));
+
+    buf_printf(o, "HTTP/1.1 %d %s\r\n", res->status, cttp_status_text(res->status));
+    buf_printf(o, "Server: cttp/%s\r\nServer-Request-Id: %s\r\n",
+               CTTP_VERSION, c->req.req_id);
     buf_printf(o, "Date: %s\r\n", date);
 
     int no_body = res->no_body || res->status == 204 || res->status == 304 ||
@@ -480,8 +1119,6 @@ static void http_finalize_response(conn *c, server *s, http_response *res)
 
     if (!no_body) {
         if (res->chunked) {
-            /* Streaming: length unknown up-front -> chunked transfer
-             * encoding (RFC 9112 §7.1). */
             buf_append_str(o, "Transfer-Encoding: chunked\r\n");
         } else {
             buf_printf(o, "Content-Type: %s\r\n",
@@ -493,19 +1130,12 @@ static void http_finalize_response(conn *c, server *s, http_response *res)
     if (!c->keep_alive)
         buf_append_str(o, "Connection: close\r\n");
 
-    if (res->extra_hdr[0])
-        buf_append_str(o, res->extra_hdr);
+    buf_append(o, res->headers.data, res->headers.len);  /* handler headers */
+    buf_append_str(o, "\r\n");                          /* blank line      */
 
-    buf_append_str(o, "\r\n");                  /* blank line ends headers */
-
-    if (no_body) {
-        http_res_free(res);
-        c->state = CONN_WRITE;
-        return;
-    }
+    if (no_body) { c->state = CONN_WRITE; return; }
 
     if (res->chunked) {
-        /* Each chunk: "<hex length>\r\n<data>\r\n" ... then "0\r\n\r\n". */
         for (size_t i = 0; i < res->body.len; i += 4096) {
             size_t n = res->body.len - i > 4096 ? 4096 : res->body.len - i;
             buf_printf(o, "%zx\r\n", n);
@@ -514,70 +1144,68 @@ static void http_finalize_response(conn *c, server *s, http_response *res)
         }
         buf_append_str(o, "0\r\n\r\n");
     } else if (!res->head_only) {
-        /* HEAD: emit headers only — but Content-Length above already
-         * reflects what a GET would return, so the body must not be appended. */
+        /* HEAD: Content-Length above reflects a GET; body stays silent. */
         buf_append(o, res->body.data, res->body.len);
     }
 
-    http_res_free(res);
     c->state = CONN_WRITE;
 }
 
-/* ---- request-line and header parsing --------------------------------------- */
+/* ---- request-line and header parsing -------------------------------------- */
 
-/* Split "GET /a/b?x=1 HTTP/1.1" into parts.
- * Return 0 ok, -1 malformed, -2 unsupported version. */
-static int parse_request_line(char *line, http_request *r)
+/* Split "GET /a/b?x=1 HTTP/1.1". 0 ok / -1 malformed / -2 bad version. */
+static int parse_request_line(char *line, cttp_request *r)
 {
     char *sp1 = strchr(line, ' ');
     char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
-    if (!sp1 || !sp2) return -1;               /* need exactly 2 spaces */
-    *sp1 = '\0';
-    *sp2 = '\0';
+    if (!sp1 || !sp2) return -1;
+    *sp1 = '\0'; *sp2 = '\0';
 
     snprintf(r->method_str, sizeof r->method_str, "%s", line);
     r->method = method_from_str(line);
     snprintf(r->target, sizeof r->target, "%s", sp1 + 1);
 
-    /* version: exactly "HTTP/1.0" or "HTTP/1.1" */
     const char *ver = sp2 + 1;
     if (strncmp(ver, "HTTP/1.", 7) != 0) return -2;
     if (ver[7] == '0' && ver[8] == '\0')      r->version_minor = 0;
     else if (ver[7] == '1' && ver[8] == '\0') r->version_minor = 1;
     else return -2;
 
-    /* Split target into path and query. (Percent-decoding of the path is
-     * deliberately left out — see README "exercises".) */
+    /* Split target into decoded path + raw query. */
+    char raw_path[1024];
     const char *q = strchr(r->target, '?');
     if (q) {
-        snprintf(r->path,  sizeof r->path,  "%.*s", (int)(q - r->target), r->target);
+        snprintf(raw_path, sizeof raw_path, "%.*s", (int)(q - r->target), r->target);
         snprintf(r->query, sizeof r->query, "%s", q + 1);
     } else {
-        snprintf(r->path,  sizeof r->path,  "%s", r->target);
+        snprintf(raw_path, sizeof raw_path, "%s", r->target);
+        r->query[0] = '\0';
     }
+    if (cttp_url_decode(r->path, sizeof r->path, raw_path, 0) != 0)
+        return -1;
     return 0;
 }
 
-/* Try to parse a complete header block from the front of c->in.
- * 1 = parsed, 0 = incomplete (need more bytes), -1 = malformed/flood. */
+/* Parse a complete header block from conn->in.
+ * 1 = parsed, 0 = incomplete, -1 = malformed/flood. */
 static int parse_headers(conn *c)
 {
     buf_t *in = &c->in;
-    http_request *r = &c->req;
+    cttp_request *r = &c->req;
     const char *data = in->data;
     size_t len = in->len;
 
-    /* 1. Is the terminator "\r\n\r\n" present yet? */
+    /* 1. Wait until the terminator "\r\n\r\n" has arrived. */
     if (len < 4) return 0;
     const char *end = NULL;
     for (size_t i = 0; i + 3 < len; i++)
         if (memcmp(data + i, "\r\n\r\n", 4) == 0) { end = data + i; break; }
-    if (!end) return len > CT_MAX_HEADER_SZ ? -1 : 0;
+    if (!end) return len > CTTP_MAX_HEADER_SZ ? -1 : 0;
 
     size_t block_len = (size_t)(end - data) + 4;
-    if (block_len > CT_MAX_HEADER_SZ) return -1;
+    if (block_len > CTTP_MAX_HEADER_SZ) return -1;
 
-    /* 2. Scratch copy: NUL-terminated lines are parsed in place. */
+    /* 2. Scratch copy: lines must be NUL-terminated to parse in place. */
     char *block = malloc(block_len + 1);
     memcpy(block, data, block_len);
     block[block_len] = '\0';
@@ -589,43 +1217,40 @@ static int parse_headers(conn *c)
     if (parse_request_line(p, r) != 0) { free(block); return -1; }
     p = cr + 2;
 
-    /* 4. Header lines: "Name: value", until the empty CRLF line. */
+    /* 4. Header lines "Name: value" until the empty line. */
     while (*p) {
-        if (p[0] == '\r' && p[1] == '\n') break;   /* end of headers */
+        if (p[0] == '\r' && p[1] == '\n') break;    /* end of headers */
         char *nl = strstr(p, "\r\n");
         if (!nl) { free(block); return -1; }
         *nl = '\0';
-        if (r->nheaders >= CT_MAX_HEADERS) { free(block); return -1; }
+        if (r->nheaders >= CTTP_MAX_HEADERS) { free(block); return -1; }
         char *colon = strchr(p, ':');
         if (!colon) { free(block); return -1; }
         *colon = '\0';
         const char *val = colon + 1;
-        while (*val == ' ' || *val == '\t') val++;   /* strip leading OWS */
+        while (*val == ' ' || *val == '\t') val++;
         snprintf(r->headers[r->nheaders].name,  64,  "%s", p);
         snprintf(r->headers[r->nheaders].value, 768, "%s", val);
         r->nheaders++;
         p = nl + 2;
     }
 
-    buf_consume(in, block_len);            /* parsed bytes are consumed */
+    buf_consume(in, block_len);
     free(block);
     return 1;
 }
 
-/* ---- body handling ---------------------------------------------------------- */
+/* ---- body handling --------------------------------------------------------- */
 
-/* Interim response: both the 100 and the final response live in conn->out
- * in order; want_continue tells the flush logic to resume body reading. */
+/* RFC 9111 §10.1.1: acknowledge Expect: 100-continue before reading. */
 static void send_continue_100(conn *c)
 {
     buf_append_str(&c->out, "HTTP/1.1 100 Continue\r\n\r\n");
     c->want_continue = 1;
-    c->next_state = c->state;      /* resume where the parse left off */
+    c->next_state = c->state;
     c->state = CONN_WRITE;
 }
 
-/* Content-Length body: copy bytes from conn->in into req.body until the
- * promised length is reached. 1 = complete, 0 = need more. */
 static int read_body_clength(conn *c)
 {
     long long avail = (long long)c->in.len;
@@ -638,13 +1263,8 @@ static int read_body_clength(conn *c)
     return c->body_remaining == 0;
 }
 
-/* Chunked transfer decoding (RFC 9112 §7.1), incremental state machine:
- *
- *   "1a;ext\r\n" + 26 data bytes + "\r\n"  ->  one chunk
- *   "0\r\n\r\n"                            ->  done
- *
- * chunk_stage: 0 = reading size line, 1 = inside data, 2 = trailer.
- * 1 = done, 0 = need more, negative = protocol error. */
+/* Chunked decoding (RFC 9112 §7.1): "<hex>[;ext]\r\n<data>\r\n" ... "0\r\n\r\n"
+ * chunk_stage: 0 size line, 1 data, 2 trailer. 1 done, 0 need more, <0 error */
 static int read_body_chunked(conn *c)
 {
     buf_t *in = &c->in;
@@ -653,7 +1273,7 @@ static int read_body_chunked(conn *c)
         const char *data = in->data;
         size_t len = in->len;
 
-        if (c->chunk_stage == 0) {                 /* size line */
+        if (c->chunk_stage == 0) {
             const char *nl = memchr(data, '\n', len);
             if (!nl) return len > 8192 ? -1 : 0;
             size_t line_len = (size_t)(nl - data) + 1;
@@ -663,15 +1283,15 @@ static int read_body_chunked(conn *c)
             line[line_len - 1] = '\0';
             buf_consume(in, line_len);
 
-            char *semi = strchr(line, ';');        /* ignore extensions */
+            char *semi = strchr(line, ';');
             if (semi) *semi = '\0';
             unsigned long long sz = strtoull(line, NULL, 16);
-            if (c->req.body.len + (size_t)sz > CT_MAX_BODY_SZ) return -2;
+            if (c->req.body.len + (size_t)sz > CTTP_MAX_BODY_SZ) return -2;
             c->chunk_rem = (long long)sz;
             c->chunk_stage = sz ? 1 : 2;
         }
-        else if (c->chunk_stage == 1) {            /* chunk data */
-            if (c->chunk_rem == 0) {               /* expect CRLF after data */
+        else if (c->chunk_stage == 1) {
+            if (c->chunk_rem == 0) {                 /* expect CRLF line  */
                 if (len < 2) return 0;
                 if (data[0] != '\r' || data[1] != '\n') return -1;
                 buf_consume(in, 2);
@@ -682,30 +1302,26 @@ static int read_body_chunked(conn *c)
                 buf_append(&c->req.body, data, take);
                 buf_consume(in, take);
                 c->chunk_rem -= (long long)take;
-                if (c->chunk_rem == 0) c->chunk_stage = 1; /* wait for CRLF */
             }
         }
-        else {                                     /* trailer section */
+        else {                                       /* trailer section   */
             if (len == 0) return 0;
             if (len >= 2 && data[0] == '\r' && data[1] == '\n') {
                 buf_consume(in, 2);
-                return 1;                          /* blank line: finished */
+                return 1;
             }
             const char *nl = memchr(data, '\n', len);
-            if (!nl) return len > 8192 ? -1 : 0;   /* skip trailer line */
+            if (!nl) return len > 8192 ? -1 : 0;
             buf_consume(in, (size_t)(nl - data) + 1);
         }
     }
 }
 
-/* Determine body mode from headers and set conn->state.
- * 0 = reading body, 1 = no body (dispatch now), negative = error:
- *   -1 malformed, -2 body too large. */
+/* Pick body mode from headers; 0 = reading body, 1 = no body. <0 error. */
 static int begin_body(conn *c)
 {
-    http_request *r = &c->req;
+    cttp_request *r = &c->req;
 
-    /* RFC 9112 §6.5: if Transfer-Encoding: chunked is present it wins. */
     const char *te = req_get_header(r, "Transfer-Encoding");
     if (te && has_token(te, "chunked")) {
         c->chunk_stage = 0;
@@ -713,49 +1329,42 @@ static int begin_body(conn *c)
         c->state = CONN_READ_CHUNK;
         return 0;
     }
-
     const char *cl = req_get_header(r, "Content-Length");
     if (cl) {
         char *endp;
         long long n = strtoll(cl, &endp, 10);
         if (endp == cl || *endp != '\0' || n < 0) return -1;
-        if (n > CT_MAX_BODY_SZ) return -2;
+        if (n > CTTP_MAX_BODY_SZ) return -2;
         c->body_remaining = n;
         c->state = CONN_READ_BODY;
-        return 0;                                  /* even n==0: completes
-                                                      on next step */
+        return 0;
     }
-    return 1;                                      /* no body at all */
+    return 1;
 }
 
-/* http_response lives on the heap because handlers embed it into bigger
- * document flows; the finalize step consumes it. */
-static void dispatch_request(conn *c, server *s)
+/* request helpers declared in cttp.h are implemented in api.c; engine needs
+ * req_get_header externally for the middleware dispatch, so expose: */
+const char *cttp_header(const cttp_request *r, const char *name)
 {
-    http_response *res = malloc(sizeof *res);
-    http_res_init(res);
-    res->head_only = (c->req.method == HTTP_HEAD);
-
-    router_dispatch(s, &c->req, res, NULL);
-    http_finalize_response(c, s, res);
+    return req_get_header(r, name);
 }
 
-/* ---- explicit error response then close-or-respond --------------------------- */
+/* ---- the read state machine ------------------------------------------------ */
 
+static void dispatch_request(conn *c, cttp_server *s);
+
+/* Bad request / oversized bodies etc: build the error response now. */
 static int error_response(conn *c, int status, const char *msg)
 {
-    http_response *res = malloc(sizeof *res);
-    http_res_init(res);
-    http_res_error(res, status, msg);
-    http_finalize_response(c, NULL, res);
+    cttp_response res;
+    memset(&res, 0, sizeof res);
+    cttp_json_err(&res, status, msg);
+    http_finalize_response(c, NULL, &res);
+    buf_free(&res.body); buf_free(&res.headers);
     return STEP_RESP_READY;
 }
 
-/* ---- the read state machine ----------------------------------------------------
- * Call after every read() that appended bytes (and right after accept).
- * Advances the connection as far as the available bytes allow.
- * Returns STEP_NEED_MORE / STEP_RESP_READY / STEP_FATAL. */
-int http_read_step(conn *c, server *s)
+int http_read_step(conn *c, cttp_server *s)
 {
     for (;;) {
         switch (c->state) {
@@ -765,35 +1374,23 @@ int http_read_step(conn *c, server *s)
             if (pr == 0) return STEP_NEED_MORE;
             if (pr < 0)  return error_response(c, 400, "malformed request");
 
-            http_request *r = &c->req;
-            if (r->method == HTTP_UNKNOWN)
+            cttp_request *r = &c->req;
+            if (r->method == CTTP_UNKNOWN)
                 return error_response(c, 501, "method not implemented");
 
-            /* Decide the body mode BEFORE anything else: this both picks
-             * the next state and lets an oversized Content-Length be
-             * rejected with 413 without ever reading 10 MB of junk. */
             int b = begin_body(c);
             if (b < 0)
                 return error_response(c, b == -2 ? 413 : 400,
                                       b == -2 ? "request body too large"
                                               : "bad content-length");
+            if (b == 1) { dispatch_request(c, s); return STEP_RESP_READY; }
 
-            if (b == 1) {
-                /* No body: dispatch immediately. */
-                dispatch_request(c, s);
-                return STEP_RESP_READY;
-            }
-
-            /* RFC 9111 §10.1.1: with Expect: 100-continue acknowledge the
-             * intent first ("yes, send your body"), then keep reading.
-             * begin_body() already entered CONN_READ_BODY/CHUNK, so after
-             * the interim flush resumes exactly at the right state. */
             const char *expect = req_get_header(r, "Expect");
             if (expect && strcasecmp(expect, "100-continue") == 0) {
                 send_continue_100(c);
                 return STEP_NEED_MORE;
             }
-            continue;   /* move to body states */
+            continue;
         }
 
         case CONN_READ_BODY:
@@ -810,26 +1407,43 @@ int http_read_step(conn *c, server *s)
             return STEP_RESP_READY;
         }
 
-        case CONN_WRITE:    /* between requests / mid-flush */
+        case CONN_WRITE:
         case CONN_CLOSED:
             return STEP_NEED_MORE;
         }
     }
 }
 
+/* Request complete: middleware -> route -> build the response bytes. */
+static void dispatch_request(conn *c, cttp_server *s)
+{
+    cttp_response res;
+    memset(&res, 0, sizeof res);
+    res.head_only = (c->req.method == CTTP_HEAD);
+    res.stream_handle = c;             /* SSE writers reach the socket */
+
+    router_dispatch(s, &c->req, &res);
+
+    /* access-log hook fires once per request, right before the bytes go  */
+    if (s && s->on_log && c->req.responded)
+        s->on_log(&c->req, res.status, c->streamed ? 0 : res.body.len);
+
+    http_finalize_response(c, s, &res);
+
+    buf_free(&res.body);
+    buf_free(&res.headers);
+}
+
 
 /* ==== from internals/router.c ==== */
 /* ==========================================================================
- * router.c — URL routing with ":parameter" captures.
+ * router.c — URL routing: ":params", wildcards, middleware, custom 404.
  *
- * A route pattern like "/api/users/:id/files/:name" matches the request
- * path "/api/users/42/files/report.txt" and captures:
- *      id   = "42"
- *      name = "report.txt"
+ * A pattern like "/api/users/:id/files" + a wildcard segment, against the request path "/api/users/42/files/a.txt"
+ * captures:  id = "42",  … = "a.txt" (wildcard = rest of the path).
  *
- * Matching is done by splitting both the pattern and the path into '/'
- * separated segments and comparing them one by one. A segment starting
- * with ':' matches anything and records the value.
+ * Matching walks pattern and path one '/'-segment at a time; ':' captures
+ * one percent-decoded segment, '*' swallows the remainder.
  * ========================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -838,70 +1452,130 @@ int http_read_step(conn *c, server *s)
 
 
 
-/* Value captured for parameter `name` in this request, or NULL. */
-const char *req_param(const http_request *r, const char *name)
+/* The middleware chain needs cttp_next() to find the server. The loop is
+ * single-threaded, so one static pointer set right before dispatch is
+ * safe and simple (larger frameworks thread a context through instead). */
+static cttp_server *g_router;
+
+/* Hand the request to the next middleware in the chain; when the chain
+ * runs out, control returns to router_dispatch which runs the route.  */
+static void mw_next(cttp_request *req, cttp_response *res)
 {
-    for (int i = 0; i < r->nparams; i++)
-        if (strcmp(r->params[i], name) == 0)
-            return r->pvalues[i];
-    return NULL;
+    cttp_server *s = g_router;
+    int i = req->mw_cur + 1;
+    if (i < s->nmw) {
+        req->mw_cur = i;
+        s->mw[i](req, res, mw_next);
+    }
 }
 
-/* Try to match one route pattern against the request path.
- * Return 1 on match (fills req->params), 0 on no match, 2 on path match
- * but wrong method (used to produce a precise 405). */
-static int route_match(const route *rt, const http_request *r)
+/* Copy the next '/'-separated segment from *s, advancing the cursor and
+ * reporting where the segment started. 1 = segment read, 0 = end.       */
+static int next_seg(const char **s, const char **start,
+                    char *out, size_t n)
 {
-    char pat[256], path[1024];
-    snprintf(pat, sizeof pat, "%s", rt->pattern);
-    snprintf(path, sizeof path, "%s", r->path);
+    const char *p = *s;
+    while (*p == '/') p++;
+    *start = p;
+    if (!*p) { out[0] = '\0'; *s = p; return 0; }
+    const char *e = strchr(p, '/');
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    if (len >= n) len = n - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    *s = e ? e + 1 : p + len;
+    return 1;
+}
 
-    http_request tmp;
-    http_init_request(&tmp);
+/* One route vs one request. 1 = match (captures set), 2 = path matches
+ * but the method differs (drives a precise 405), 0 = no match.          */
+static int route_match(int ridx, cttp_request *req)
+{
+    const char *p = g_router->routes[ridx].pattern;
+    char pathcopy[1024];                    /* walk a scratch copy    */
+    snprintf(pathcopy, sizeof pathcopy, "%s", req->path);
+    const char *q = pathcopy, *qseg_start = pathcopy;
 
-    char *psave = NULL, *rsave = NULL;
-    char *pseg = strtok_r(pat, "/", &psave);
-    char *rseg = strtok_r(path, "/", &rsave);
+    char pseg[128], qseg[512];
     int np = 0;
+    int result = 0;    /* 0 = no match, 1 = path + wildcard/direct hit */
 
-    while (pseg || rseg) {
-        if (!pseg || !rseg) { http_free_request(&tmp); return 0; }
-        if (pseg[0] == ':') {                       /* capture parameter */
-            if (np >= CT_MAX_PARAMS) { http_free_request(&tmp); return 0; }
-            snprintf(tmp.params[np],  64,               "%s", pseg + 1);
-            snprintf(tmp.pvalues[np], CT_MAX_PARAM_STR, "%s", rseg);
-            np++;
-        } else if (strcmp(pseg, rseg) != 0) {
-            http_free_request(&tmp); return 0;      /* literal mismatch */
+
+    for (;;) {
+        const char *pstart = p;
+        int has_p = next_seg(&p, &pstart, pseg, sizeof pseg);
+        int has_q = next_seg(&q, &qseg_start, qseg, sizeof qseg);
+
+        if (!has_p && !has_q) { result = 1; break; }   /* both done */
+
+        if (has_p != has_q) {                 /* one side ran out       */
+            /* "/files/" + wildcard with nothing left: value = ""  */
+            if (has_p && pseg[0] == '*' && np < CTTP_MAX_PARAMS) {
+                cttp_request *rw = (cttp_request *)req;
+                snprintf(rw->params[np], 64, "%s", pseg);
+                rw->pvalues[np][0] = '\0';
+                np++;
+                result = 1;
+            }
+            break;
         }
-        pseg = strtok_r(NULL, "/", &psave);
-        rseg = strtok_r(NULL, "/", &rsave);
+
+        cttp_request *rw = (cttp_request *)req;
+        if (pseg[0] == ':') {                /* one-segment capture    */
+            if (np >= CTTP_MAX_PARAMS) break;
+            snprintf(rw->params[np], 64, "%s", pseg + 1);
+            if (cttp_url_decode(rw->pvalues[np], 256, qseg, 0) != 0)
+                break;
+            np++;
+    } else if (pseg[0] == '*') {         /* swallow what's left    */
+            if (np >= CTTP_MAX_PARAMS) break;
+            snprintf(rw->params[np], 64, "%s", pseg);
+            /* rest starts AT the current path segment (qseg_start) */
+            if (cttp_url_decode(rw->pvalues[np], 256, qseg_start, 0) != 0)
+                break;
+            np++;
+            result = 1;
+            break;
+        } else if (strcmp(pseg, qseg) != 0) {
+            break;                           /* literal mismatch       */
+        }
     }
 
-    /* path matched — copy captured params into a mutable view of the
-     * request: the comment says what happened — drop const deliberately */
-    http_request *rw = (http_request *)r;
-    memcpy(rw->params,  tmp.params,  sizeof rw->params);
-    memcpy(rw->pvalues, tmp.pvalues, sizeof rw->pvalues);
-    rw->nparams = np;
-    http_free_request(&tmp);
-
-    return rt->method == r->method ? 1 : 2;
+    if (result != 0) {
+        cttp_request *rw = (cttp_request *)req;
+        /* commit captured params into the request */
+        rw->nparams = np;
+        /* HEAD is automatically served by GET handlers (the engine strips
+     * the body when res.head_only is set) — RFC 9110 §9.3.2 behaviour. */
+    cttp_method rm = g_router->routes[ridx].method;
+    int ok = rm == req->method ||
+             (req->method == CTTP_HEAD && rm == CTTP_GET);
+    return ok ? 1 : 2;
+    }
+    return 0;
 }
 
-/* Find the best route and invoke it, or fall back sensibly:
- *   - no match at all        -> static file serving (webroot)
- *   - static can't serve it  -> 404 (with JSON body, like all errors)
- *   - path exists but method -> 405 Not Allowed with an Allow header
- */
-void router_dispatch(server *s, http_request *req, http_response *res,
-                     const char *realpath_used)
+/* Middleware, then route, with sane fallbacks:
+ *   OPTIONS without registration -> Allow: list (RFC 9110 §9.3.7)
+ *   path exists, wrong method    -> 405 + Allow (always engine-made)
+ *   GET/HEAD with a webroot      -> filesystem; missing file -> hook 404
+ *   otherwise                    -> on_error hook or default JSON 404 */
+void router_dispatch(cttp_server *s, cttp_request *req, cttp_response *res)
 {
-    (void)realpath_used;
-    int method_mismatch = 0;
+    g_router = s;
+    req->mw_cur = -1;
 
+    if (s->nmw > 0) {                     /* enter the chain         */
+        req->mw_cur = 0;
+        s->mw[0](req, res, mw_next);
+    }
+
+    if (res->responded)                   /* short-circuited: done   */
+        return;
+
+    int method_mismatch = 0;
     for (int i = 0; i < s->nroutes; i++) {
-        int m = route_match(&s->routes[i], req);
+        int m = route_match(i, req);
         if (m == 1) {
             s->routes[i].handler(req, res);
             return;
@@ -909,31 +1583,30 @@ void router_dispatch(server *s, http_request *req, http_response *res,
         if (m == 2) method_mismatch = 1;
     }
 
-    /* Built-in OPTIONS handler: the HTTP spec (RFC 9110 §9.3.7) says an
-     * OPTIONS response should list the methods the server supports. */
-    if (req->method == HTTP_OPTIONS) {
+    if (req->method == CTTP_OPTIONS) {
         res->status = 200;
-        snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                 "Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS\r\n");
-        buf_append_str(&res->body, "");
+        cttp_set_header(res, "Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS");
+        res->responded = 1;
         return;
     }
 
-    if (method_mismatch) {
-        http_res_error(res, 405, "method not allowed");
-        snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                 "Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS\r\n");
+    if (method_mismatch) {                /* engine-owned, like OPTIONS */
+        cttp_json_err(res, 405, "method not allowed");
+        cttp_set_header(res, "Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS");
+        res->responded = 1;
         return;
     }
 
-    /* Fall back to static filesystem serving for GET/HEAD; everything
-     * else becomes a JSON 404. */
-    if (req->method == HTTP_GET || req->method == HTTP_HEAD) {
-        static_serve(s, req, res);
-        return;
+    if ((req->method == CTTP_GET || req->method == CTTP_HEAD) && s->webroot) {
+        static_serve(s, req, res);        /* filesystem fallback        */
+        res->responded = 1;               /* static_serve always answers */
     }
 
-    http_res_error(res, 404, "resource not found");
+    if (!res->responded) {
+        if (s->on_error) s->on_error(req, res);
+        else            cttp_json_err(res, 404, "resource not found");
+        res->responded = 1;
+    }
 }
 
 
@@ -941,11 +1614,11 @@ void router_dispatch(server *s, http_request *req, http_response *res,
 /* ==========================================================================
  * static.c — serving files from the webroot.
  *
- * Modern static serving needs more than open()+read()+send():
+ * Beyond open()+read()+write() this module layers on the modern bits:
  *   * path traversal protection  ("/../etc/passwd" must never escape)
  *   * MIME types by file extension
- *   * ETag + conditional requests (If-None-Match -> 304 Not Modified)
- *   * Range requests (resumable downloads, <video> seeking) -> 206
+ *   * ETag + If-None-Match  ->  304 Not Modified
+ *   * Range requests        ->  206 Partial Content (download resume)
  * ========================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -993,9 +1666,10 @@ static const char *mime_for(const char *path)
     return "application/octet-stream";
 }
 
-/* Reject traversal attempts. The path lives inside c->in, which is never
- * write raw to the socket, but it DOES end up in open() — so ".." and
- * NUL-ish shenanigans must be rejected before the filesystem call. */
+/* Reject traversal attempts. The path is percent-decoded by the parser,
+ * which is exactly why this check runs on req->path: "%2e%2e" has already
+ * become ".." here, so encoded trips are caught by the same test that
+ * catches literal ones.                                             */
 static int is_unsafe_path(const char *p)
 {
     if (!p || p[0] != '/') return 1;
@@ -1003,8 +1677,7 @@ static int is_unsafe_path(const char *p)
     return 0;
 }
 
-/* Read the whole file referred to by `path` (already open, fd at 0).
- * Returns a heap buffer of exactly *out_len bytes, or NULL. */
+/* Read the whole open file. Heap buffer of exactly *out_len bytes. */
 static char *read_whole_file(int fd, size_t *out_len)
 {
     struct stat st;
@@ -1016,7 +1689,7 @@ static char *read_whole_file(int fd, size_t *out_len)
     while (total < len) {
         ssize_t n = read(fd, data + total, len - total);
         if (n < 0) { if (errno == EINTR) continue; free(data); return NULL; }
-        if (n == 0) break;               /* EOF before st_size? trust read */
+        if (n == 0) break;             /* EOF early: trust read() */
         total += (size_t)n;
     }
     *out_len = total;
@@ -1024,18 +1697,16 @@ static char *read_whole_file(int fd, size_t *out_len)
     return data;
 }
 
-/* Serve fs paths under webroot for GET/HEAD. */
-void static_serve(server *s, http_request *req, http_response *res)
+void static_serve(cttp_server *s, cttp_request *req, cttp_response *res)
 {
     char path[2048];
 
     if (!s->webroot || is_unsafe_path(req->path)) {
-        http_res_error(res, 403, "path not allowed");
+        cttp_json_err(res, 403, "path not allowed");
         return;
     }
 
-    /* Map the URL path onto the filesystem. Directory requests get
-     * index.html appended (the classic "/path/" convention). */
+    /* URL path -> filesystem path (index.html for directories). */
     if (strcmp(req->path, "/") == 0)
         snprintf(path, sizeof path, "%s/index.html", s->webroot);
     else if (req->path[strlen(req->path) - 1] == '/')
@@ -1044,36 +1715,37 @@ void static_serve(server *s, http_request *req, http_response *res)
         snprintf(path, sizeof path, "%s%s", s->webroot, req->path);
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { http_res_error(res, 404, "resource not found"); return; }
+    if (fd < 0) {
+        cttp_json_err(res, 404, "resource not found");
+        return;
+    }
     struct stat st;
     fstat(fd, &st);
-    if (S_ISDIR(st.st_mode)) {/* is a directory: retry with trailing-slash convention */
+    if (S_ISDIR(st.st_mode)) {          /* "/dir" without the slash       */
         close(fd);
         snprintf(path, sizeof path, "%s%s/index.html", s->webroot, req->path);
         fd = open(path, O_RDONLY);
-        if (fd < 0) { http_res_error(res, 404, "resource not found"); return; }
+        if (fd < 0) { cttp_json_err(res, 404, "resource not found"); return; }
         fstat(fd, &st);
     }
 
-    /* ETag = size + mtime, hex. Cheap, effective for cache validation:
-     * identical string means the browser's cached copy is still valid. */
+    /* ETag = size + mtime. Same string => browser cache still valid. */
     char etag[64];
     snprintf(etag, sizeof etag, "\"%zx-%zx\"",
              (size_t)st.st_size, (size_t)st.st_mtime);
 
-    /* Conditional request: If-None-Match asks "is my cache still good?"  */
-    const char *inm = req->get_header(req, "If-None-Match");
+    const char *inm = cttp_header(req, "If-None-Match");
     if (inm && strstr(inm, etag)) {
         close(fd);
-        res->status = 304;               /* 304 responses carry no body  */
+        res->status = 304;
         res->no_body = 1;
-        snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                 "ETag: %s\r\nCache-Control: max-age=3600\r\n", etag);
+        cttp_set_header(res, "ETag", etag);
+        cttp_cache(res, 3600);
         return;
     }
 
-    /* Byte-range requests: if satisfiable, send exactly that slice. */
-    const char *rh = req->get_header(req, "Range");
+    /* Range: bytes=N-M, satisfied with a 206 slice. */
+    const char *rh = cttp_header(req, "Range");
     if (rh) {
         unsigned long long start, end, total = (unsigned long long)st.st_size;
         if (sscanf(rh, "bytes=%llu-%llu", &start, &end) == 2 &&
@@ -1082,9 +1754,10 @@ void static_serve(server *s, http_request *req, http_response *res)
         } else if (sscanf(rh, "bytes=%llu-", &start) == 1 && start < total) {
             end = total - 1;
         } else {
-            /* Unsatisfiable: RFC 9110 §14.2 wants the real size back. */
-            snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                     "Content-Range: bytes */%llu\r\n", total);
+            /* unsatisfiable: RFC 9110 §14.2 wants the real size back */
+            char cr[64];
+            snprintf(cr, sizeof cr, "bytes */%llu", total);
+            cttp_set_header(res, "Content-Range", cr);
             res->status = 416;
             res->no_body = 1;
             close(fd);
@@ -1105,25 +1778,26 @@ void static_serve(server *s, http_request *req, http_response *res)
 
         res->status = 206;
         snprintf(res->ctype, sizeof res->ctype, "%s", mime_for(path));
-        snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                 "Content-Range: bytes %llu-%llu/%llu\r\n",
+        char cr[64];
+        snprintf(cr, sizeof cr, "bytes %llu-%llu/%llu",
                  start, start + got - 1, total);
+        cttp_set_header(res, "Content-Range", cr);
         buf_free(&res->body);
         buf_append(&res->body, data, got);
         free(data);
         return;
     }
 
-    /* Plain full-file 200. */
+    /* Plain 200 with the whole file. */
     size_t len = 0;
     char *data = read_whole_file(fd, &len);
     close(fd);
-    if (!data) { http_res_error(res, 500, "read failed"); return; }
+    if (!data) { cttp_json_err(res, 500, "read failed"); return; }
 
     res->status = 200;
     snprintf(res->ctype, sizeof res->ctype, "%s", mime_for(path));
-    snprintf(res->extra_hdr, sizeof res->extra_hdr,
-             "ETag: %s\r\nCache-Control: max-age=3600\r\n", etag);
+    cttp_set_header(res, "ETag", etag);
+    cttp_cache(res, 3600);
     buf_free(&res->body);
     buf_append(&res->body, data, len);
     free(data);
@@ -1134,18 +1808,12 @@ void static_serve(server *s, http_request *req, http_response *res)
 /* ==========================================================================
  * server.c — sockets + the poll() event loop.
  *
- * ARCHITECTURE (the heart of the whole program)
- * ---------------------------------------------
- * One thread multiplexes every socket with poll(), using non-blocking I/O
- * (O_NONBLOCK). An fd is never allowed to block: when write/read would
- * block one simply stops and resume when poll() says the socket is ready.
- *
- * pfds[] and conns[] are parallel arrays: pfds[i] describes fd state for
- * conns[i]. pfds[0] is always the listening socket.
- *
- *   accept() --+--> conn state machine (see http.c)
- *              |
- *   idle sockets are reaped after server.timeout_secs seconds
+ * ARCHITECTURE
+ * ------------
+ * One thread multiplexes every socket with poll() on non-blocking fds.
+ * Nothing blocks: read()/write()/accept() return EAGAIN when the kernel
+ * can't proceed, and the loop resumes when poll() says the socket is
+ * ready. pfds[] and conns[] are parallel arrays; pfds[0] is the listener.
  * ========================================================================== */
 #include <poll.h>
 #include <stdio.h>
@@ -1159,29 +1827,25 @@ void static_serve(server *s, http_request *req, http_response *res)
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 
 
 
-#define LISTEN_BACKLOG     128
-#define IO_CHUNK           16384   /* bytes per read()/write() attempt   */
-#define POLL_INTERVAL_MS   1000    /* wake up at least this often        */
+#define LISTEN_BACKLOG   128
+#define IO_CHUNK         16384    /* bytes per read()/write() attempt   */
+#define POLL_INTERVAL_MS 1000     /* wake up at least this often        */
 
-/* Signal handlers can't get arguments, so the handler needs a way back to
- * the server struct: a file-scope pointer, written only at startup. */
-static server *g_server;
+/* Signal handlers get no arguments; the loop checks this flag instead.
+ * (fancier designs use the "self-pipe" trick to wake poll() instantly). */
+static cttp_server *g_server;
 static void handle_signal(int sig)
 {
     (void)sig;
-    /* The only "work" in a signal handler: set a volatile-sig_atomic_t
-     * flag; the event loop checks it between iterations. For more
-     * complex designs use the "self-pipe" trick. */
     if (g_server) g_server->running = 0;
 }
 
 /* ---- connection table -------------------------------------------------- */
 
-static void table_reserve(server *s, int need)
+static void table_reserve(cttp_server *s, int need)
 {
     if (need <= s->cap) return;
     int newcap = s->cap ? s->cap : 16;
@@ -1192,16 +1856,15 @@ static void table_reserve(server *s, int need)
     s->cap = newcap;
 }
 
-/* Set fd non-blocking: an O_NONBLOCK socket's read()/write() return
- * EAGAIN instead of stalling the whole server (classic blocking servers
- * used create one thread instead — a trade-off discussed in the README). */
+/* O_NONBLOCK sockets return EAGAIN instead of stalling the whole server. */
 static void set_nonblock(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void conn_reset_for_next(conn *c)
+/* Reset a connection slot for the next keep-alive request. */
+static void conn_reset_for_next(conn *c, cttp_server *s)
 {
     http_free_request(&c->req);
     http_init_request(&c->req);
@@ -1210,14 +1873,20 @@ static void conn_reset_for_next(conn *c)
     c->chunk_rem      = 0;
     c->chunk_stage    = 0;
     c->keep_alive     = 0;
+    c->streamed       = 0;
     c->want_continue  = 0;
     c->state          = CONN_READ_HEADERS;
     buf_consume(&c->out, c->out.len);
-    /* NOTE: c->in is NOT emptied — anything the client already sent for
-     * the next request (pipelining) must survive for the next parse. */
+
+    /* X-Request-Id: unique per request, visible in responses and logs. */
+    s->req_counter++;
+    snprintf(c->req.req_id, sizeof c->req.req_id, "%zx-%zx",
+             (size_t)time(NULL), (size_t)s->req_counter);
+    /* NOTE: c->in is NOT emptied — bytes the client already sent for
+     * the next pipelined request survive for the next parse. */
 }
 
-static void conn_close(server *s, int idx)
+static void conn_close(cttp_server *s, int idx)
 {
     conn *c = s->conns[idx];
     close(c->fd);
@@ -1226,93 +1895,18 @@ static void conn_close(server *s, int idx)
     buf_free(&c->out);
     free(c);
 
-    /* Remove slot idx by moving the last entry into it (O(1), but it
-     * changes iteration order — the loop tolerates re-checking slots). */
+    /* O(1) removal by moving the last slot into idx (the loop tolerates
+     * re-checking the replacement slot). */
     s->conns[idx] = s->conns[s->nconns - 1];
     s->pfds[idx]  = s->pfds[s->nconns - 1];
     s->nconns--;
 }
 
-/* === setup & teardown ===================================================== */
-
-/* Create the listening socket: the classic four-socket-API steps —
- * socket() -> setsockopt() -> bind() -> listen(). We keep it referenced
- * as pfds[0] in the poll array (see server_run). */
-int server_init(server *s, const char *host, int port, const char *webroot)
-{
-    memset(s, 0, sizeof *s);
-    table_reserve(s, 1);
-
-    /* AF_INET + SOCK_STREAM = TCP over IPv4. */
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return -1; }
-
-    /* SO_REUSEADDR removes the TIME_WAIT wait after restarts, otherwise
-     * a crash/restart loop would lose the port for up to 2*MSL (~2 min). */
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);              /* network byte order */
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        fprintf(stderr, "invalid address: %s\n", host);
-        close(fd);
-        return -1;
-    }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        perror("bind");
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, LISTEN_BACKLOG) < 0) {
-        perror("listen");
-        close(fd);
-        return -1;
-    }
-
-    /* Also make the LISTENING socket non-blocking: poll() then wakes us
-     * only when a connection is *guaranteed* (no thundering-herd accept),
-     * and the accept-for loop below can safely spin until EAGAIN. */
-    set_nonblock(fd);
-
-    s->listen_fd = fd;
-    s->port = port;
-    s->timeout_secs = 30;
-    snprintf(s->host, sizeof s->host, "%s", host);
-    s->webroot = webroot;
-    s->pfds[0] = (struct pollfd){ .fd = fd, .events = POLLIN };
-    s->conns[0] = NULL;                    /* slot 0 is the listener */
-    s->nconns = 1;
-    return 0;
-}
-
-int server_route(server *s, http_method m, const char *pattern, http_handler h)
-{
-    if (s->nroutes >= CT_MAX_ROUTES) return -1;
-    snprintf(s->routes[s->nroutes].pattern, 256, "%s", pattern);
-    s->routes[s->nroutes].method = m;
-    s->routes[s->nroutes].handler = h;
-    s->nroutes++;
-    return 0;
-}
-
-void server_free(server *s)
-{
-    for (int i = s->nconns - 1; i >= 1; i--)
-        conn_close(s, i);
-    close(s->listen_fd);
-    free(s->pfds);
-    free(s->conns);
-}
-
 /* ---- accepting connections ---------------------------------------------- */
 
-static void accept_new_clients(server *s)
+static void accept_new_clients(cttp_server *s)
 {
-    for (;;) {                                /* accept until EAGAIN:
-                                                  multiple clients may be
-                                                  queued at once */
+    for (;;) {
         struct sockaddr_in addr;
         socklen_t alen = sizeof addr;
         int fd = accept(s->listen_fd, (struct sockaddr *)&addr, &alen);
@@ -1324,8 +1918,7 @@ static void accept_new_clients(server *s)
         }
 
         set_nonblock(fd);
-        /* Nagle's algorithm batches small writes (40ms delay); an HTTP
-         * server with small responses usually wants TCP_NODELAY. */
+        /* Nagle batches small writes (~40ms latency); responses want it off */
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
@@ -1336,65 +1929,120 @@ static void accept_new_clients(server *s)
         c->last_activity = time(NULL);
         http_init_request(&c->req);
         s->conns[s->nconns] = c;
-        s->pfds[s->nconns]  = (struct pollfd){
-            .fd = fd, .events = POLLIN, .revents = 0 };
+        s->pfds[s->nconns]  = (struct pollfd){ .fd = fd, .events = POLLIN };
         s->nconns++;
+        conn_reset_for_next(c, s);      /* request id + fresh state */
     }
 }
 
 /* ---- flushing outgoing bytes --------------------------------------------- */
 
-/* Write as much of conn->out as the socket kernel buffer accepts right
- * now (non-blocking). Returns -1 on hard error (peer gone). */
+/* Write what the kernel accepts right now; 0 = kernel full, -1 gone. */
 static int flush_conn(conn *c)
 {
     while (c->out_off < c->out.len) {
         ssize_t n = send(c->fd, c->out.data + c->out_off,
                          c->out.len - c->out_off, MSG_NOSIGNAL);
-        if (n > 0) {
-            c->out_off += (size_t)n;
-            continue;
-        }
+        if (n > 0) { c->out_off += (size_t)n; continue; }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            return 0;                       /* kernel buffer full; retry
-                                               when poll says POLLOUT   */
-        return -1;                          /* EPIPE and friends: gone  */
+            return 0;                   /* retry when POLLOUT is ready */
+        return -1;
     }
-    return 1;                               /* fully flushed */
+    return 1;                           /* fully flushed */
 }
 
-static void on_flush_complete(server *s, int idx)
+static void on_flush_complete(cttp_server *s, int idx)
 {
     conn *c = s->conns[idx];
 
-    if (c->want_continue) {
-        /* The "100 Continue" interim response just went out. Resume
-         * exactly where the header parse left off (usually reading the
-         * body the client has presumably already started sending). */
+    if (c->want_continue) {             /* 100 Continue just went out */
         c->want_continue = 0;
         c->state = c->next_state;
         c->out_off = 0;
         buf_consume(&c->out, c->out.len);
-        return;                             /* next poll loop continues */
+        return;
     }
 
     if (c->keep_alive) {
-        conn_reset_for_next(c);             /* ready for next request (keep-alive) */
+        conn_reset_for_next(c, s);      /* ready for the next request */
         return;
     }
-    conn_close(s, idx);                     /* Connection: close */
+    conn_close(s, idx);                 /* Connection: close */
+}
+
+/* ---- config & routes ----------------------------------------------------- */
+
+int cttp_init(cttp_server *s)
+{
+    memset(s, 0, sizeof *s);
+    /* friendly defaults; override the fields before cttp_listen */
+    snprintf(s->host, sizeof s->host, "127.0.0.1");
+    s->port         = 8080;
+    s->timeout_secs = 30;
+    s->listen_fd    = -1;
+    return 0;
+}
+
+static int route_add(cttp_server *s, cttp_method m,
+                     const char *pattern, cttp_handler h)
+{
+    if (s->nroutes >= CTTP_MAX_ROUTES) {
+        cttp_log_error("route limit reached: %s", pattern);
+        return -1;
+    }
+    snprintf(s->routes[s->nroutes].pattern, 256, "%s", pattern);
+    s->routes[s->nroutes].method  = m;
+    s->routes[s->nroutes].handler = h;
+    s->nroutes++;
+    return 0;
+}
+
+int cttp_route(cttp_server *s, cttp_method m,
+               const char *pattern, cttp_handler h)
+{
+    return route_add(s, m, pattern, h);
+}
+
+void cttp_get(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_GET, p, h); }
+void cttp_head(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_HEAD, p, h); }
+void cttp_post(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_POST, p, h); }
+void cttp_put(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_PUT, p, h); }
+void cttp_delete(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_DELETE, p, h); }
+void cttp_patch(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_PATCH, p, h); }
+void cttp_options(cttp_server *s, const char *p, cttp_handler h)
+{ route_add(s, CTTP_OPTIONS, p, h); }
+
+void cttp_use(cttp_server *s, cttp_middleware mw)
+{
+    if (s->nmw < CTTP_MAX_MIDDLEWARE)
+        s->mw[s->nmw++] = mw;
+}
+
+void cttp_on_error(cttp_server *s,
+                   void (*h)(cttp_request *, cttp_response *))
+{
+    s->on_error = h;
+}
+
+void cttp_on_log(cttp_server *s,
+                 void (*h)(const cttp_request *, int, size_t))
+{
+    s->on_log = h;
 }
 
 /* ---- the event loop ------------------------------------------------------ */
 
-void server_run(server *s)
+void cttp_listen(cttp_server *s)
 {
     g_server = s;
     s->running = 1;
-
-    /* SIGPIPE: writing to a socket the peer already closed would kill the
-     * process by default. We ignore it and treat writes as errors instead. */
     signal(SIGPIPE, SIG_IGN);
 
     struct sigaction sa = { .sa_handler = handle_signal };
@@ -1402,16 +2050,45 @@ void server_run(server *s)
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    log_info("listening on http://%s:%d (webroot: %s)",
-             s->host, s->port, s->webroot ? s->webroot : "(none)");
+    /* socket() -> setsockopt() -> bind() -> listen(); the listener is
+     * also non-blocking so the accept loop below spins until EAGAIN.  */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)s->port);
+    if (inet_pton(AF_INET, s->host, &addr.sin_addr) != 1) {
+        cttp_log_error("invalid address: %s", s->host);
+        close(fd);
+        return;
+    }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        perror("bind");
+        close(fd);
+        return;
+    }
+    if (listen(fd, LISTEN_BACKLOG) < 0) {
+        perror("listen");
+        close(fd);
+        return;
+    }
+    set_nonblock(fd);
+
+    table_reserve(s, 1);
+    s->listen_fd = fd;
+    s->pfds[0]   = (struct pollfd){ .fd = fd, .events = POLLIN };
+    s->conns[0]  = NULL;                 /* slot 0 = listener      */
+    s->nconns    = 1;
+
+    cttp_log_info("listening on http://%s:%d (webroot: %s)",
+                  s->host, s->port, s->webroot ? s->webroot : "(none)");
 
     while (s->running) {
-        /* --- RENEW INTEREST: recompute what each socket should listen for.
-         * This is the event-loop contract most tutorials skip: poll()'s
-         * .events are static, so the loop must update them every iteration to
-         * reflect each connection's state machine —
-         *   pending response bytes -> also want POLLOUT (writability),
-         *   otherwise -> want POLLIN (new request bytes). */
+        /* RENEW INTEREST: poll()'s .events are ours to maintain —
+         * pending response bytes => also ask for POLLOUT, else POLLIN. */
         for (int i = 1; i < s->nconns; i++)
             s->pfds[i].events = POLLIN |
                 ((s->conns[i]->out_off < s->conns[i]->out.len)
@@ -1419,79 +2096,71 @@ void server_run(server *s)
 
         int rc = poll(s->pfds, (nfds_t)s->nconns, POLL_INTERVAL_MS);
         if (rc < 0) {
-            if (errno == EINTR) continue;   /* signal interrupted us */
+            if (errno == EINTR) continue;
             perror("poll");
             break;
         }
 
-        /* --- listening socket readable => pending client connections --- */
         if (s->pfds[0].revents & POLLIN)
             accept_new_clients(s);
         s->pfds[0].revents = 0;
 
-        /* --- service each ready connection ---------------------------- */
         for (int i = 1; i < s->nconns; ) {
             conn *c = s->conns[i];
-            short rev = s->pfds[i].revents; /* copy: slot may move on close */
+            short rev = s->pfds[i].revents;   /* slot may move on close */
             s->pfds[i].revents = 0;
-            int handled = 1;                /* did this slot get consumed? */
+            int handled = 1;
 
             if (rev & (POLLERR | POLLHUP | POLLNVAL)) {
                 conn_close(s, i);
                 handled = 0;
             }
-            else if ((rev & POLLIN)) {
-                /* Caller wants new bytes. Drain until the socket would
-                 * block — fewer poll() round trips per request. */
+            else if (rev & POLLIN) {
                 char tmp[IO_CHUNK];
                 for (;;) {
                     ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
                     if (n > 0) {
                         buf_append(&c->in, tmp, (size_t)n);
                         c->last_activity = time(NULL);
-                        if (n < (ssize_t)sizeof tmp) break;   /* drained */
+                        if (n < (ssize_t)sizeof tmp) break;
                         continue;
                     }
-                    if (n == 0) {                 /* peer closed cleanly */
-                        conn_close(s, i);
-                        handled = 0;
-                        break;
-                    }
+                    if (n == 0) { conn_close(s, i); handled = 0; break; }
                     if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                    conn_close(s, i);             /* ECONNRESET etc     */
-                    handled = 0;
-                    break;
+                    conn_close(s, i); handled = 0; break;
                 }
-                if (handled) {
-                    c->last_activity = time(NULL);
-                    if (http_read_step(c, s) < 0) {   /* STEP_FATAL */
-                        conn_close(s, i);
-                        handled = 0;
-                    }
+                if (handled && http_read_step(c, s) < 0) {
+                    conn_close(s, i); handled = 0;
                 }
             }
             else if (rev & POLLOUT) {
                 int r = flush_conn(c);
                 if (r < 0) { conn_close(s, i); handled = 0; }
                 else if (r == 1) on_flush_complete(s, i);
-                /* r == 0: kernel buffer full; retry on next POLLOUT */
             }
 
             if (handled) i++;
-            /* if the slot was freed, the last entry moved into it — do
-             * NOT advance: examine the replacement slot as well */
         }
 
-        /* --- reap idle connections (simple DoS hygiene) ---------------- */
+        /* reap idle connections (simple DoS hygiene) */
         time_t now = time(NULL);
-        for (int i = s->nconns - 1; i >= 1; i--) {
+        for (int i = s->nconns - 1; i >= 1; i--)
             if (now - s->conns[i]->last_activity > s->timeout_secs)
                 conn_close(s, i);
-        }
     }
 
-    log_info("shutting down");
+    cttp_log_info("shutting down");
+}
+
+void cttp_free(cttp_server *s)
+{
+    close(s->listen_fd);
+    free(s->pfds);
+    free(s->conns);
+    s->pfds = NULL;
+    s->conns = NULL;
+    s->nconns = s->cap = 0;
 }
 
 #endif /* CTTP_IMPLEMENTATION */

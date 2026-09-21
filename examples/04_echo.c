@@ -1,69 +1,57 @@
 /* ==========================================================================
- * 04_echo.c — request inspection playground: bodies, headers, methods.
+ * 04_echo.c — a body/query/cookie/headers playground in one route + crumbs.
  *
  * Build:  make && ./build/04_echo
  * Try:
- *   curl -X POST -d 'hello cttp' http://127.0.0.1:8084/echo
- *   curl -X PUT  -d 'AaBb' http://127.0.0.1:8084/echo/upper
- *   curl -X DELETE http://127.0.0.1:8084/echo    (204)
- *   curl http://127.0.0.1:8084/inspect           (pretty header dump)
+ *   curl -X POST -d 'name=Ada&email=ada%40ex.com' http://127.0.0.1:8084/echo
+ *   # form-decoding — no more manual url decoding
+ *   curl -X PUT  -d 'hello cttp' http://127.0.0.1:8084/echo
+ *   curl -b 'sid=abc123' -X POST -d 'x=1' http://127.0.0.1:8084/echo
+ *   curl -c - -X POST -d 'y=2' http://127.0.0.1:8084/echo; echo;   (Set-Cookie)
+ *   curl -X DELETE http://127.0.0.1:8084/echo                    (204)
  * ========================================================================== */
 #define CTTP_IMPLEMENTATION
 #include "cttp.h"
 
-static void echo(http_request *req, http_response *res)
+static void echo(cttp_request *req, cttp_response *res)
 {
-    const char *ct = req->get_header(req, "Content-Type");
-    buf_t out = {0};
+    /* hand back a session cookie when the client sent none */
+    if (!cttp_cookie(req, "sid"))
+        cttp_set_cookie(res, "sid", "abc123", &(cttp_cookie_opts){
+            .max_age = 3600, .http_only = 1, .same_site = "Lax" });
 
-    if (req_param(req, "mode") && strcmp(req_param(req, "mode"), "upper") == 0)
-        for (size_t i = 0; i < req->body.len; i++) {
-            char c = req->body.data[i];
-            if (c >= 'a' && c <= 'z') c -= 32;      /* to upper-case */
-            buf_append(&out, &c, 1);
-        }
-    else
-        buf_append(&out, req->body.data, req->body.len);
+    const char *ct = cttp_header(req, "Content-Type");
+    if (cttp_streq_i(ct, "application/x-www-form-urlencoded")) {
+        cttp_html(res, 200,
+            "<h1>form</h1><p>name=%s</p><p>email=%s</p>\n",
+            cttp_form(req, "name"), cttp_form(req, "email"));
+        return;
+    }
 
-    http_res_set(res, 200, ct ? ct : "text/plain", out.data, out.len);
-    buf_free(&out);
+    cttp_json_begin(res);
+    cttp_json_str(res, "content_type", ct);
+    cttp_json_int(res, "length", (long long)req->body.len);
+    cttp_json_str(res, "raw", req->body.data);
+    cttp_json_str(res, "sid_cookie", cttp_cookie(req, "sid"));
+    cttp_json_end(res, 200);
 }
 
-static void no_content(http_request *req, http_response *res)
+static void no_content(cttp_request *req, cttp_response *res)
 {
     (void)req;
-    res->status = 204;
-    res->no_body = 1;
-}
-
-static void inspect(http_request *req, http_response *res)
-{
-    buf_printf(&res->body, "method: %s\n", req->method_str);
-    buf_printf(&res->body, "path:   %s\nquery: %s\n", req->path, req->query);
-    buf_printf(&res->body, "HTTP/1.%d with %d headers:\n",
-               req->version_minor, req->nheaders);
-    for (int i = 0; i < req->nheaders; i++)
-        buf_printf(&res->body, "  %s: %s\n",
-                   req->headers[i].name, req->headers[i].value);
-    buf_printf(&res->body, "body %zu bytes\n", req->body.len);
-
-    http_res_set(res, 200, "text/plain; charset=utf-8",
-                 res->body.data, res->body.len);
+    cttp_no_content(res);
 }
 
 int main(void)
 {
-    server s;
-    if (server_init(&s, "127.0.0.1", 8084, NULL) != 0)
-        return 1;
+    cttp_server srv;
+    cttp_init(&srv);
+    srv.port = 8084;
 
-    server_route(&s, HTTP_GET,    "/inspect",     inspect);
-    server_route(&s, HTTP_DELETE, "/echo",        no_content);
-    server_route(&s, HTTP_POST,   "/echo",        echo);
-    server_route(&s, HTTP_POST,   "/echo/:mode",  echo);
-    server_route(&s, HTTP_PUT,    "/echo",        echo);
+    cttp_post(&srv,   "/echo", echo);
+    cttp_put(&srv,    "/echo", echo);
+    cttp_delete(&srv, "/echo", no_content);
 
-    server_run(&s);
-    server_free(&s);
-    return 0;
+    cttp_listen(&srv);
+    cttp_free(&srv);
 }

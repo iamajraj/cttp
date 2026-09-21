@@ -1,11 +1,11 @@
 /* ==========================================================================
  * static.c — serving files from the webroot.
  *
- * Modern static serving needs more than open()+read()+send():
+ * Beyond open()+read()+write() this module layers on the modern bits:
  *   * path traversal protection  ("/../etc/passwd" must never escape)
  *   * MIME types by file extension
- *   * ETag + conditional requests (If-None-Match -> 304 Not Modified)
- *   * Range requests (resumable downloads, <video> seeking) -> 206
+ *   * ETag + If-None-Match  ->  304 Not Modified
+ *   * Range requests        ->  206 Partial Content (download resume)
  * ========================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,9 +53,10 @@ static const char *mime_for(const char *path)
     return "application/octet-stream";
 }
 
-/* Reject traversal attempts. The path lives inside c->in, which is never
- * write raw to the socket, but it DOES end up in open() — so ".." and
- * NUL-ish shenanigans must be rejected before the filesystem call. */
+/* Reject traversal attempts. The path is percent-decoded by the parser,
+ * which is exactly why this check runs on req->path: "%2e%2e" has already
+ * become ".." here, so encoded trips are caught by the same test that
+ * catches literal ones.                                             */
 static int is_unsafe_path(const char *p)
 {
     if (!p || p[0] != '/') return 1;
@@ -63,8 +64,7 @@ static int is_unsafe_path(const char *p)
     return 0;
 }
 
-/* Read the whole file referred to by `path` (already open, fd at 0).
- * Returns a heap buffer of exactly *out_len bytes, or NULL. */
+/* Read the whole open file. Heap buffer of exactly *out_len bytes. */
 static char *read_whole_file(int fd, size_t *out_len)
 {
     struct stat st;
@@ -76,7 +76,7 @@ static char *read_whole_file(int fd, size_t *out_len)
     while (total < len) {
         ssize_t n = read(fd, data + total, len - total);
         if (n < 0) { if (errno == EINTR) continue; free(data); return NULL; }
-        if (n == 0) break;               /* EOF before st_size? trust read */
+        if (n == 0) break;             /* EOF early: trust read() */
         total += (size_t)n;
     }
     *out_len = total;
@@ -84,18 +84,16 @@ static char *read_whole_file(int fd, size_t *out_len)
     return data;
 }
 
-/* Serve fs paths under webroot for GET/HEAD. */
-void static_serve(server *s, http_request *req, http_response *res)
+void static_serve(cttp_server *s, cttp_request *req, cttp_response *res)
 {
     char path[2048];
 
     if (!s->webroot || is_unsafe_path(req->path)) {
-        http_res_error(res, 403, "path not allowed");
+        cttp_json_err(res, 403, "path not allowed");
         return;
     }
 
-    /* Map the URL path onto the filesystem. Directory requests get
-     * index.html appended (the classic "/path/" convention). */
+    /* URL path -> filesystem path (index.html for directories). */
     if (strcmp(req->path, "/") == 0)
         snprintf(path, sizeof path, "%s/index.html", s->webroot);
     else if (req->path[strlen(req->path) - 1] == '/')
@@ -104,36 +102,37 @@ void static_serve(server *s, http_request *req, http_response *res)
         snprintf(path, sizeof path, "%s%s", s->webroot, req->path);
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { http_res_error(res, 404, "resource not found"); return; }
+    if (fd < 0) {
+        cttp_json_err(res, 404, "resource not found");
+        return;
+    }
     struct stat st;
     fstat(fd, &st);
-    if (S_ISDIR(st.st_mode)) {/* is a directory: retry with trailing-slash convention */
+    if (S_ISDIR(st.st_mode)) {          /* "/dir" without the slash       */
         close(fd);
         snprintf(path, sizeof path, "%s%s/index.html", s->webroot, req->path);
         fd = open(path, O_RDONLY);
-        if (fd < 0) { http_res_error(res, 404, "resource not found"); return; }
+        if (fd < 0) { cttp_json_err(res, 404, "resource not found"); return; }
         fstat(fd, &st);
     }
 
-    /* ETag = size + mtime, hex. Cheap, effective for cache validation:
-     * identical string means the browser's cached copy is still valid. */
+    /* ETag = size + mtime. Same string => browser cache still valid. */
     char etag[64];
     snprintf(etag, sizeof etag, "\"%zx-%zx\"",
              (size_t)st.st_size, (size_t)st.st_mtime);
 
-    /* Conditional request: If-None-Match asks "is my cache still good?"  */
-    const char *inm = req->get_header(req, "If-None-Match");
+    const char *inm = cttp_header(req, "If-None-Match");
     if (inm && strstr(inm, etag)) {
         close(fd);
-        res->status = 304;               /* 304 responses carry no body  */
+        res->status = 304;
         res->no_body = 1;
-        snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                 "ETag: %s\r\nCache-Control: max-age=3600\r\n", etag);
+        cttp_set_header(res, "ETag", etag);
+        cttp_cache(res, 3600);
         return;
     }
 
-    /* Byte-range requests: if satisfiable, send exactly that slice. */
-    const char *rh = req->get_header(req, "Range");
+    /* Range: bytes=N-M, satisfied with a 206 slice. */
+    const char *rh = cttp_header(req, "Range");
     if (rh) {
         unsigned long long start, end, total = (unsigned long long)st.st_size;
         if (sscanf(rh, "bytes=%llu-%llu", &start, &end) == 2 &&
@@ -142,9 +141,10 @@ void static_serve(server *s, http_request *req, http_response *res)
         } else if (sscanf(rh, "bytes=%llu-", &start) == 1 && start < total) {
             end = total - 1;
         } else {
-            /* Unsatisfiable: RFC 9110 §14.2 wants the real size back. */
-            snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                     "Content-Range: bytes */%llu\r\n", total);
+            /* unsatisfiable: RFC 9110 §14.2 wants the real size back */
+            char cr[64];
+            snprintf(cr, sizeof cr, "bytes */%llu", total);
+            cttp_set_header(res, "Content-Range", cr);
             res->status = 416;
             res->no_body = 1;
             close(fd);
@@ -165,25 +165,26 @@ void static_serve(server *s, http_request *req, http_response *res)
 
         res->status = 206;
         snprintf(res->ctype, sizeof res->ctype, "%s", mime_for(path));
-        snprintf(res->extra_hdr, sizeof res->extra_hdr,
-                 "Content-Range: bytes %llu-%llu/%llu\r\n",
+        char cr[64];
+        snprintf(cr, sizeof cr, "bytes %llu-%llu/%llu",
                  start, start + got - 1, total);
+        cttp_set_header(res, "Content-Range", cr);
         buf_free(&res->body);
         buf_append(&res->body, data, got);
         free(data);
         return;
     }
 
-    /* Plain full-file 200. */
+    /* Plain 200 with the whole file. */
     size_t len = 0;
     char *data = read_whole_file(fd, &len);
     close(fd);
-    if (!data) { http_res_error(res, 500, "read failed"); return; }
+    if (!data) { cttp_json_err(res, 500, "read failed"); return; }
 
     res->status = 200;
     snprintf(res->ctype, sizeof res->ctype, "%s", mime_for(path));
-    snprintf(res->extra_hdr, sizeof res->extra_hdr,
-             "ETag: %s\r\nCache-Control: max-age=3600\r\n", etag);
+    cttp_set_header(res, "ETag", etag);
+    cttp_cache(res, 3600);
     buf_free(&res->body);
     buf_append(&res->body, data, len);
     free(data);

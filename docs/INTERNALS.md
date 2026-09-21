@@ -23,17 +23,35 @@ of threads.
 | # | file | what you learn |
 |---|------|----------------|
 | 1 | `internals/cttp.h`   | data model: request / response / connection |
-| 2 | `internals/buf.c`    | growable byte buffers |
-| 3 | `internals/http.c`   | incremental parsing, bodies (Content-Length + chunked), 100-continue, response assembly |
-| 4 | `internals/router.c` | pattern routes with `:params`, 405 + `Allow:`, OPTIONS |
-| 5 | `internals/static.c` | MIME, ETag/304, byte ranges 206/416, traversal protection |
-| 6 | `internals/server.c` | poll() loop, non-blocking I/O, idle timeout, signals |
-| 7 | `internals/main.c`   | wiring everything together |
+| 2 | `internals/buf.c`    | growable byte buffers + unbounded printf append |
+| 3 | `internals/http.c`   | engine: decoding, bodies (CL + chunked), 100-continue, finalize |
+| 4 | `internals/api.c`    | the helper layer: JSON builder, cookies, query/form, SSE |
+| 5 | `internals/router.c` | `:params`, `*` wildcards, middleware chain, 405/OPTIONS |
+| 6 | `internals/static.c` | MIME, ETag/304, byte ranges 206/416, traversal protection |
+| 7 | `internals/server.c` | poll() loop, non-blocking I/O, idle timeout, signals |
+| 8 | `internals/main.c`   | everything wired together |
 
 …then:
 ```sh
-sh scripts/gen_lib.sh     # burn the updated sources into the one-file cttp.h
+sh scripts/gen_lib.sh     # burn the updated sources into include/cttp.h
 ```
+
+## What v2 added to the engine (find each in the comment map above)
+
+- **Percent-decoding** happens once per request in `parse_request_line`;
+  the path is decoded BEFORE the `..` check, so `/%2e%2e/` traversals are
+  caught by the same test that catches literal dots.
+- **Response headers became a `buf_t`** (`res->headers`): any number of
+  `cttp_set_header/cookie/cors` lines, CRLF-injection rejected by name.
+- **SSE**: `cttp_sse_start` writes headers immediately, `cttp_sse_send`
+  wraps each event in a chunk via the `stream_write` hook; when the
+  handler returns, finalize only appends the terminating `0\r\n\r\n`
+  (see `conn->streamed`).
+- **Middleware**: dispatch runs `mw[0]`; each level resumes via
+  `cttp_next` with a cursor on the request (`req->mw_cur`). Any
+  responder sets `res.responded`, which short-circuits the chain.
+- **X-Request-Id** generated per request (`Server-Request-Id` header);
+  see `conn_reset_for_next`.
 
 ## Two bugs every event loop author hits
 

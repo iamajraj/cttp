@@ -1,131 +1,113 @@
 /* ==========================================================================
- * main.c — configuration, demo routes, wiring.
+ * main.c — demo wiring: one of everything the library offers.
  * ========================================================================== */
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "cttp.h"
 
-/* ---- demo route handlers -------------------------------------------------
- * A handler receives the parsed request and must fill in the response.
- * Nothing here blocks: real servers would use a thread pool for slow
- * work (DB queries, templates) — see README "going further".           */
-
-static void h_hello(http_request *req, http_response *res)
-{
-    http_res_json(res, 200, "{\"hello\":\"world\",\"server\":\"cttp\"}");
-}
-
-/* Route params were captured by router.c: /api/users/:id */
-static void h_user(http_request *req, http_response *res)
-{
-    const char *id = req_param(req, "id");
-    char json[256];
-    snprintf(json, sizeof json, "{\"id\":\"%s\",\"name\":\"user %s\"}",
-             id, id);
-    http_res_json(res, 200, json);
-}
-
-/* Echo the request body back with the client's content-type. */
-static void h_echo(http_request *req, http_response *res)
-{
-    const char *ct = req->get_header(req, "Content-Type");
-    const char *mode = req_param(req, "mode");   /* /api/echo/:mode optional */
-    if (mode && strcmp(mode, "upper") == 0) {
-        buf_t out = {0};
-        for (size_t i = 0; i < req->body.len; i++) {
-            char c = req->body.data[i];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            buf_append(&out, &c, 1);
-        }
-        http_res_set(res, 200, ct ? ct : "text/plain",
-                     out.data, out.len);
-        buf_free(&out);
-        return;
-    }
-    http_res_set(res, 200, ct ? ct : "text/plain",
-                 req->body.data, req->body.len);
-}
-
-/* Streaming response: chunked transfer encoding exercised end-to-end. */
-static void h_stream(http_request *req, http_response *res)
-{
-    for (int i = 1; i <= 5; i++)
-        buf_printf(&res->body, "capped chunk %d\n", i);
-    res->status = 200;
-    snprintf(res->ctype, sizeof res->ctype, "text/plain");
-    res->chunked = 1;                   /* http.c encodes chunks at send */
-}
-
-/* Small debug endpoint: shows every header the client sent. */
-static void h_headers(http_request *req, http_response *res)
-{
-    buf_printf(&res->body, "{\"method\":\"%s\",\"path\":\"%s\","
-                           "\"headers\":[", req->method_str, req->path);
-    for (int i = 0; i < req->nheaders; i++)
-        buf_printf(&res->body, "%s{\"name\":\"%s\",\"value\":\"%s\"}",
-                   i ? "," : "", req->headers[i].name, req->headers[i].value);
-    buf_append_str(&res->body, "]}");
-    http_res_json(res, 200, res->body.data);
-}
-
-static void h_no_content(http_request *req, http_response *res)
+static void hello(cttp_request *req, cttp_response *res)
 {
     (void)req;
-    res->status = 204;                  /* 204 must not carry a body */
-    res->no_body = 1;
+    cttp_json_begin(res);
+    cttp_json_str(res, "hello", "world");
+    cttp_json_str(res, "quote", "say \"hi\"\nnewline\ttab");
+    cttp_json_str(res, "server", "cttp/" CTTP_VERSION);
+    cttp_json_end(res, 200);
 }
 
-/* ---- wiring --------------------------------------------------------------- */
-
-static void register_routes(server *s)
+/* :id parameter capture + query string access. */
+static void get_user(cttp_request *req, cttp_response *res)
 {
-    server_route(s, HTTP_GET,     "/api/hello",    h_hello);
-    server_route(s, HTTP_GET,     "/api/users/:id", h_user);
-    server_route(s, HTTP_GET,     "/api/headers",  h_headers);
-    server_route(s, HTTP_GET,     "/api/stream",   h_stream);
-    server_route(s, HTTP_DELETE,  "/api/echo",     h_no_content);
-    server_route(s, HTTP_POST,    "/api/echo",     h_echo);
-    server_route(s, HTTP_POST,    "/api/echo/:mode", h_echo);
-    server_route(s, HTTP_PUT,     "/api/echo",     h_echo);
+    cttp_json_begin(res);
+    cttp_json_str(res, "id", cttp_param(req, "id"));
+    cttp_json_str(res, "name", cttp_query(req, "name"));
+    cttp_json_str(res, "req_id", cttp_req_id(req));
+    cttp_json_end(res, 200);
 }
 
-static void usage(const char *argv0)
+/* Middleware: touches every response before the route runs. */
+static void add_header_mw(cttp_request *req, cttp_response *res,
+                          cttp_next next)
 {
-    fprintf(stderr,
-        "cttp — a tiny educational HTTP/1.1 server\n"
-        "usage: %s [-p port] [-a address] [-r webroot] [-t timeout]\n",
-        argv0);
+    (void)req;
+    cttp_set_header(res, "X-Middleware", "ran-before-route");
+    next(req, res);
+}
+
+/* POST/PUT echo of the raw body; DELETE => 204. */
+static void echo(cttp_request *req, cttp_response *res)
+{
+    if (req->method == CTTP_DELETE) { cttp_no_content(res); return; }
+
+    cttp_json_begin(res);
+    cttp_json_str(res, "content_type", cttp_header(req, "Content-Type"));
+    cttp_json_int(res, "length", (long long)req->body.len);
+    cttp_json_str(res, "raw", req->body.data);
+    cttp_json_str(res, "email", cttp_form(req, "email"));
+    cttp_json_str(res, "sid", cttp_cookie(req, "sid"));
+    cttp_json_end(res, 200);
+}
+
+/* JSON + escaping demo */
+static void json_demo(cttp_request *req, cttp_response *res)
+{
+    (void)req;
+    cttp_json_begin(res);
+    cttp_json_str(res, "message", "line one\nsecond \"quoted\"\tvalue");
+    cttp_json_int(res, "id", 42);
+    cttp_json_bool(res, "ok", 1);
+    cttp_json_null(res, "nothing");
+    cttp_json_arr_begin(res, "tags");
+    cttp_json_str(res, NULL, "c");
+    cttp_json_str(res, NULL, "http");
+    cttp_json_arr_end(res);
+    cttp_json_obj_begin(res, "nested");
+    cttp_json_str(res, "deep", "yes \"indeed\"");
+    cttp_json_obj_end(res);
+    cttp_json_end(res, 200);
+}
+
+/* SSE live feed. */
+static void stream(cttp_request *req, cttp_response *res)
+{
+    (void)req;
+    cttp_sse_start(res);
+    for (int i = 1; i <= 5; i++) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "tick %d", i);
+        cttp_sse_send(res, "tick", msg);
+    }
+}
+
+/* Demo logger hook: one line per request, right after handling. */
+static void access_log(const cttp_request *req, int status, size_t bytes)
+{
+    cttp_log_info("%s %s -> %d (%zu bytes, id %s)",
+                  req->method_str, req->path, status, bytes);
 }
 
 int main(int argc, char **argv)
 {
-    int port = 8080;
-    const char *host = "127.0.0.1";
-    const char *webroot = "public";
-    int timeout_secs = 30;
+    cttp_server s;
+    cttp_init(&s);
+    s.port = (argc > 1) ? atoi(argv[1]) : 8080;
+    s.webroot = "public";
 
-    int opt;
-    while ((opt = getopt(argc, argv, "p:a:r:t:h")) != -1) {
-        switch (opt) {
-        case 'p': port = atoi(optarg); break;
-        case 'a': host = optarg; break;
-        case 'r': webroot = optarg; break;
-        case 't': timeout_secs = atoi(optarg); break;
-        case 'h': usage(argv[0]); return 0;
-        default:  usage(argv[0]); return 1;
-        }
-    }
+    cttp_use(&s, add_header_mw);
+    cttp_on_log(&s, access_log);
 
-    server s;
-    if (server_init(&s, host, port, webroot) != 0)
-        return 1;
-    s.timeout_secs = timeout_secs;
-    register_routes(&s);
+    cttp_get(&s, "/", hello);
+    cttp_get(&s, "/api/hello", hello);
+    cttp_get(&s, "/api/users/:id", get_user);
+    cttp_get(&s, "/api/json", json_demo);
+    cttp_get(&s, "/api/stream", stream);
+    cttp_post(&s, "/api/echo", echo);
+    cttp_put(&s, "/api/echo", echo);
+    cttp_delete(&s, "/api/echo", echo);
 
-    server_run(&s);
-    server_free(&s);
+    cttp_listen(&s);
+    cttp_free(&s);
     return 0;
 }
